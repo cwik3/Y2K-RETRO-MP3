@@ -23,10 +23,11 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 // ==========================================
 #define TFT_SCLK 12
 #define TFT_MOSI 11
-#define TFT_RST  8
+#define TFT_RST  14  
 #define TFT_CS   10
-#define TFT_DC   9
-#define TFT_BL   21
+#define TFT_DC   13  // <--- Moved to safe, completely conflict-free GPIO 21
+
+
 
 #define SD_CS   5
 #define SD_MISO 19
@@ -40,11 +41,15 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define ENC_CLK 40
 #define ENC_DT  41
 #define ENC_SW  39
+#define SW1_PIN 48
+#define SW2_PIN 13
 
-#define SW1_PIN  48
-#define SW2_PIN  13
-#define POT1_PIN 1
-#define POT2_PIN 2
+// ALL SAFE ADC1 PINS
+#define POT1_PIN 1  // Master Volume
+#define POT2_PIN 2  // Low/Bass EQ
+#define POT3_PIN 7  // Mid EQ
+#define POT4_PIN 8  // High/Treble EQ
+#define POT5_PIN 9  // Stereo Balance/Pan 
 
 // ==========================================
 // 2b. DASHBOARD LAYOUT CONSTANTS
@@ -60,14 +65,13 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define INFO_H COVER_H
 
 #define NAME_X COVER_X
-#define NAME_Y (COVER_Y + COVER_H + 14)        // 78
-#define NAME_W (160 - (COVER_X * 2))          // 152
+#define NAME_Y (COVER_Y + COVER_H + 14)        
+#define NAME_W (160 - (COVER_X * 2))          
 
 #define PROGRESS_X COVER_X
-#define PROGRESS_Y (NAME_Y + 18)              // a bit more breathing room under the name row
-#define PROGRESS_W (160 - (COVER_X * 2))      // 152
+#define PROGRESS_Y (NAME_Y + 18)              
+#define PROGRESS_W (160 - (COVER_X * 2))      
 #define PROGRESS_H 4
-
 
 #define COVER_CLIP_MINX (COVER_X + 1)
 #define COVER_CLIP_MAXX (COVER_X + COVER_W - 2)
@@ -77,10 +81,6 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define SPOTIFY_IMG_X (COVER_X + 1 + ((COVER_W - 2 - 64) / 2))
 #define SPOTIFY_IMG_Y (COVER_Y + 1 + ((COVER_H - 2 - 64) / 2))
 
-// Fixed row height used to clear a text row before redrawing it (text size 1
-// glyphs are 8px tall in this font). Used instead of concatenating trailing
-// spaces onto Strings every redraw, which was creating a fresh heap
-// allocation ~5x/second and slowly fragmenting the heap over long sessions.
 #define TEXT_ROW_H 9
 
 // ==========================================
@@ -90,13 +90,6 @@ Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RS
 SPIClass spiSD(HSPI);
 Audio audio;
 
-// This mutex now guards BOTH audio.loop() AND any direct SD-card access
-// (SD.open/openNextFile/File::read/write, TJpgDec draws from SD) made from
-// the main loop/core 1. audioTask runs pinned to core 0 and shares the same
-// physical SPI bus/SD card with everything the main loop does on core 1;
-// without a shared lock, concurrent SPI transactions from both cores can
-// corrupt in-flight reads and crash the chip. It's recursive so nested
-// locking (e.g. playTrack() called while already holding the lock) is safe.
 SemaphoreHandle_t audioMutex;
 #define AUDIO_LOCK()   xSemaphoreTakeRecursive(audioMutex, portMAX_DELAY)
 #define AUDIO_UNLOCK() xSemaphoreGiveRecursive(audioMutex)
@@ -118,6 +111,7 @@ unsigned long spotifyProgressCapturedAt = 0;
 void playTrack(int idx);
 void clearCoverBox();
 bool jpegIsProgressive(File &f);
+void drawCurrentSDCover();
 
 enum AppState { STATE_MENU, STATE_SPOTIFY, STATE_SD_BROWSE, STATE_SD_PLAYING };
 AppState appState = STATE_MENU;
@@ -151,20 +145,33 @@ int currentTrackIndex = 0;
 bool isPlaying = true;
 int smoothVol = 0;
 
-// Tracks what's currently on screen so dynamic redraws can skip fields
-// that haven't changed, instead of clearing+reprinting everything every
-// tick -- this is what was making the screen feel like it was constantly
-// flickering/refreshing. Time/volume use plain char buffers (no String
-// allocation) since they're compared on every tick.
 char lastDrawnSpotifyTimeBuf[16] = "";
 bool lastDrawnSpotifyPlaying = true;
 bool spotifyTransportDrawn = false;
 
+// UI Toggles
+bool isDjMixerActive = false;
 int lastDrawnSDTrackIndex = -1;
-char lastDrawnSDTimeBuf[16] = "";
-char lastDrawnSDVolBuf[16] = "";
 bool lastDrawnSDPlaying = true;
 bool sdTransportDrawn = false;
+int lastDrawnSliders[5] = {-1, -1, -1, -1, -1};
+
+// RAM CACHE FOR INSTANT ALBUM COVER TOGGLING
+#define CACHE_W (COVER_CLIP_MAXX - COVER_CLIP_MINX + 1)
+#define CACHE_H (COVER_CLIP_MAXY - COVER_CLIP_MINY + 1)
+uint16_t coverCache[CACHE_W * CACHE_H];
+bool coverCacheValid = false;
+
+// ==========================================
+// 3b. DSP / POTENTIOMETER STATE
+// ==========================================
+int smoothBass = 2048;
+int smoothMid  = 2048;
+int smoothHigh = 2048;
+int smoothBal  = 2048;
+
+unsigned long lastDspTime = 0;
+int8_t lastBassGain = 100, lastMidGain = 100, lastHighGain = 100, lastBalance = 100;
 
 // ==========================================
 // 4. Y2K / CYBERSIGIL DRAW HELPERS
@@ -239,10 +246,6 @@ String truncateToWidth(const String &text, int maxWidth) {
   return ellipsis;
 }
 
-// Draws text after clearing its row with a solid fillRect first. Replaces
-// the old "text + a bunch of trailing spaces" trick, which allocated a new
-// String on the heap on every single redraw (5x/sec while a screen is
-// active) purely to blank out leftover pixels from a longer previous string.
 void drawClearedText(int x, int y, int w, const String &text, uint16_t fg, uint16_t bg) {
   tft.fillRect(x, y, w, TEXT_ROW_H, bg);
   tft.setTextColor(fg, bg);
@@ -270,17 +273,12 @@ void drawGlassButton(int x, int y, int w, int h, const char* label, bool selecte
   tft.print(clipped);
 }
 
-// Cover/info panels: flat fill only now, no border or corner accents.
 void drawGlassPanel(int x, int y, int w, int h) {
   tft.fillRect(x, y, w, h, COL_PANEL);
 }
 
 void drawProgressBar(int x, int y, int w, int h, int curSec, int durSec) {
   tft.drawRect(x, y, w, h, COL_DIMMER);
-  // Always clear the interior first. Previously only the new fillW was
-  // drawn, so skipping to a shorter/newer track never erased the leftover
-  // fill from the longer previous track -- that's the "bar doesn't reset"
-  // bug after switching songs.
   tft.fillRect(x + 1, y + 1, w - 2, h - 2, COL_PANEL);
   if (durSec > 0) {
     int fillW = map(constrain(curSec, 0, durSec), 0, durSec, 0, w - 2);
@@ -288,22 +286,14 @@ void drawProgressBar(int x, int y, int w, int h, int curSec, int durSec) {
   }
 }
 
-
-
 // ==========================================
 // 4b. MARQUEE (SCROLLING TEXT) HELPERS
 // ==========================================
-// Adafruit_GFX has no built-in clip rect for text, so a naive scroll would
-// bleed pixels outside the box into whatever is drawn next to it. To get a
-// real clip, the full string is rendered once into an off-screen 16-bit
-// canvas, and each frame just blits a boxW-wide *slice* of that canvas to
-// the screen at the current scroll offset -- no text re-rendering, and no
-// per-frame heap allocation, on every scroll step.
 struct Marquee {
   GFXcanvas16 *canvas;
-  String text;          // text currently rendered into canvas (cache key)
-  int textPixelW = 0;   // pixel width of that text
-  int boxW = 0;          // width of the destination box on screen
+  String text;          
+  int textPixelW = 0;   
+  int boxW = 0;          
   int scrollX = 0;
   bool scrolling = false;
   unsigned long lastStep = 0;
@@ -311,22 +301,15 @@ struct Marquee {
   Marquee(GFXcanvas16 *c) : canvas(c) {}
 };
 
-const unsigned long MARQUEE_STEP_MS = 40;   // how often the scroll advances
-const unsigned long MARQUEE_PAUSE_MS = 1000; // pause at the start of each loop
-const int MARQUEE_GAP_PX = 16;               // blank gap before the text repeats
+const unsigned long MARQUEE_STEP_MS = 40;   
+const unsigned long MARQUEE_PAUSE_MS = 1000; 
+const int MARQUEE_GAP_PX = 16;              
 
-// 260px covers roughly 40-45 characters at text size 1 -- plenty for a
-// track/artist name. Allocated once at startup and reused for the life of
-// the program, so scrolling never touches the heap.
 GFXcanvas16 artistCanvasBuf(260, TEXT_ROW_H);
 GFXcanvas16 trackCanvasBuf(260, TEXT_ROW_H);
 Marquee artistMarquee(&artistCanvasBuf);
 Marquee trackMarquee(&trackCanvasBuf);
 
-// Re-renders the canvas ONLY when the text actually changed (new song /
-// artist / filename). boxW is the width available on screen; if the text
-// is wider than that, it's flagged to scroll and a second copy is drawn
-// after a gap so the loop wraps without a visible jump.
 void marqueeSetText(Marquee &m, const String &text, int boxW, uint16_t fg, uint16_t bg) {
   m.boxW = boxW;
   if (text == m.text) return;
@@ -357,9 +340,6 @@ void marqueeSetText(Marquee &m, const String &text, int boxW, uint16_t fg, uint1
   }
 }
 
-// Blits the currently visible boxW-wide slice of the canvas to (x,y) and
-// advances the scroll offset if it's time to step. Call this frequently
-// (much faster than the once-a-second field refresh) for a smooth scroll.
 void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
   static uint16_t sliceBuf[300];
   int boxW = m.boxW;
@@ -400,19 +380,32 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
   int minX = COVER_CLIP_MINX, maxX = COVER_CLIP_MAXX;
   int minY = COVER_CLIP_MINY, maxY = COVER_CLIP_MAXY;
 
-  if (x > maxX || y > maxY || x + w - 1 < minX || y + h - 1 < minY) return 1;
-
-  if (x >= minX && x + w - 1 <= maxX && y >= minY && y + h - 1 <= maxY) {
-    tft.drawRGBBitmap(x, y, bitmap, w, h);
-    return 1;
-  }
-
   for (int j = 0; j < h; j++) {
     for (int i = 0; i < w; i++) {
       int px = x + i;
       int py = y + j;
       if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
-        tft.drawPixel(px, py, bitmap[j * w + i]);
+        coverCache[(py - minY) * CACHE_W + (px - minX)] = bitmap[j * w + i];
+      }
+    }
+  }
+
+  bool shouldDraw = false;
+  if (appState == STATE_SPOTIFY) shouldDraw = true;
+  if (appState == STATE_SD_PLAYING && !isDjMixerActive) shouldDraw = true;
+
+  if (shouldDraw) {
+    if (x >= minX && x + w - 1 <= maxX && y >= minY && y + h - 1 <= maxY) {
+      tft.drawRGBBitmap(x, y, bitmap, w, h);
+    } else {
+      for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+          int px = x + i;
+          int py = y + j;
+          if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+            tft.drawPixel(px, py, bitmap[j * w + i]);
+          }
+        }
       }
     }
   }
@@ -442,11 +435,6 @@ void audio_eof_mp3(const char *info) {
   }
 }
 
-// Quick-and-dirty progressive-vs-baseline JPEG check. TJpg_Decoder can ONLY
-// decode baseline sequential JPEGs -- it silently fails on progressive
-// JPEGs, leaving some MCU blocks undrawn (black). This scans for the SOF
-// marker: 0xFFC0/0xFFC1 = baseline, 0xFFC2 (and friends) = progressive.
-// NOTE: callers must already hold AUDIO_LOCK, since this does SD reads.
 bool jpegIsProgressive(File &f) {
   f.seek(0);
   uint8_t buf[512];
@@ -470,16 +458,14 @@ bool jpegIsProgressive(File &f) {
   return false;
 }
 
-// Called synchronously from inside audio.loop() during ID3 parsing, which
-// itself already runs under AUDIO_LOCK inside audioTask -- so this already
-// has exclusive SD access. The explicit lock/unlock here is added anyway
-// for safety since the mutex is recursive, in case this ever gets invoked
-// from a different call path in the future.
+void drawCurrentSDCover() {
+  if (coverCacheValid) {
+    tft.drawRGBBitmap(COVER_CLIP_MINX, COVER_CLIP_MINY, coverCache, CACHE_W, CACHE_H);
+  }
+}
+
 void audio_id3image(File& file, const size_t pos, const size_t size) {
-  Serial.printf("ID3 Image found! Size: %d bytes\n", size);
-
   AUDIO_LOCK();
-
   File cover = SD.open("/cover.jpg", FILE_WRITE);
   if (cover) {
     uint32_t currentPos = file.position(); 
@@ -495,39 +481,36 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
     }
     cover.close();
     file.seek(currentPos);
+  }
+  AUDIO_UNLOCK();
 
+  AUDIO_LOCK();
+  if (SD.exists("/cover.jpg")) {
     File check = SD.open("/cover.jpg");
     bool progressive = check && jpegIsProgressive(check);
     if (check) check.close();
 
-    if (progressive) {
-      Serial.println("Embedded cover is a progressive JPEG -- decoder can't handle it, skipping draw.");
-      clearCoverBox();
-      AUDIO_UNLOCK();
-      return;
+    if (!progressive) {
+      uint16_t imgW = 0, imgH = 0;
+      TJpgDec.getFsJpgSize(&imgW, &imgH, "/cover.jpg", SD);
+
+      const int maxDim = COVER_W - 2;
+      int scale = 1;
+      while ((imgW / scale > maxDim) || (imgH / scale > maxDim)) {
+        scale *= 2;
+        if (scale >= 8) break; 
+      }
+      TJpgDec.setJpgScale(scale);
+
+      int scaledW = imgW / scale;
+      int scaledH = imgH / scale;
+      int dX = COVER_CLIP_MINX + (maxDim - scaledW) / 2;
+      int dY = COVER_CLIP_MINY + (maxDim - scaledH) / 2;
+
+      TJpgDec.drawFsJpg(dX, dY, "/cover.jpg", SD);
+      coverCacheValid = true; 
     }
-
-    uint16_t imgW = 0, imgH = 0;
-    TJpgDec.getFsJpgSize(&imgW, &imgH, "/cover.jpg", SD);
-
-    const int maxDim = COVER_W - 2;
-    int scale = 1;
-    while ((imgW / scale > maxDim) || (imgH / scale > maxDim)) {
-      scale *= 2;
-      if (scale >= 8) break; 
-    }
-    TJpgDec.setJpgScale(scale);
-
-    int scaledW = imgW / scale;
-    int scaledH = imgH / scale;
-    int dX = COVER_CLIP_MINX + (maxDim - scaledW) / 2;
-    int dY = COVER_CLIP_MINY + (maxDim - scaledH) / 2;
-
-    TJpgDec.drawFsJpg(dX, dY, "/cover.jpg", SD);
-  } else {
-    Serial.println("Failed to create temp cover file.");
   }
-
   AUDIO_UNLOCK();
 }
 
@@ -535,11 +518,6 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
   if (currentlyPlaying.isPlaying) {
     currentTrack = String(currentlyPlaying.trackName);
 
-    // Guard against zero-artist responses (podcasts, local files, some
-    // compilation tracks). Indexing artists[0] unconditionally here was
-    // reading an uninitialized pointer inside the library's response buffer
-    // whenever numArtists was 0, which is exactly what produced the
-    // LoadProhibited crash at EXCVADDR 0x00000001.
     if (currentlyPlaying.numArtists > 0) {
       currentArtist = String(currentlyPlaying.artists[0].artistName);
     } else {
@@ -547,7 +525,6 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
     }
 
     spotifyIsPlaying = true;
-
     spotifyProgressMs = currentlyPlaying.progressMs;
     spotifyDurationMs = currentlyPlaying.durationMs;
     spotifyProgressCapturedAt = millis();
@@ -567,12 +544,6 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
   }
 }
 
-// NOTE: caller must hold AUDIO_LOCK around the SD-writing portion of this.
-// The lock is taken internally here, around just the file open/write span,
-// rather than around the whole HTTP GET -- holding it for the entire
-// network transfer would stall SD-audio playback for as long as the
-// download takes. Locking only the SD write still fully protects against
-// SPI bus corruption, at the cost of a much shorter, bounded stall.
 bool downloadSpotifyCover(String url) {
   if (url == "" || !sdMounted) return false;
 
@@ -592,8 +563,6 @@ bool downloadSpotifyCover(String url) {
       http.end();
 
       if (expectedLen > 0 && written != expectedLen) {
-        Serial.printf("Cover download incomplete: got %d of %d bytes, skipping decode\n",
-                      written, expectedLen);
         return false;
       }
       return true;
@@ -605,30 +574,23 @@ bool downloadSpotifyCover(String url) {
 }
 
 // ==========================================
-// 6. SD CARD TRACK LIST
+// 6. SD CARD TRACK LIST & DSP HELPERS
 // ==========================================
 void scanSDTracks() {
   AUDIO_LOCK();
-
   trackCount = 0;
   File root = SD.open("/");
   if (!root) {
-    Serial.println("SD: failed to open root directory");
     AUDIO_UNLOCK();
     return;
   }
-
-  Serial.println("\n--- SD CARD SCAN START ---");
 
   while (true) {
     File entry = root.openNextFile();
     if (!entry) break;
 
     String name = String(entry.name());
-    Serial.printf("Saw file/folder: %s ", name.c_str());
-
     if (entry.isDirectory()) {
-      Serial.println(" -> (Skipped: is a folder)");
       entry.close();
       continue;
     }
@@ -637,7 +599,6 @@ void scanSDTracks() {
     lower.toLowerCase();
 
     if (lower.indexOf("._") != -1 || lower.indexOf("/.") != -1 || lower.indexOf("system") != -1) {
-      Serial.println(" -> (Skipped: hidden system file)");
       entry.close();
       continue;
     }
@@ -646,19 +607,11 @@ void scanSDTracks() {
       if (trackCount < 40) {
         trackList[trackCount] = name;
         trackCount++;
-        Serial.println(" -> (ADDED TO PLAYLIST!)");
-      } else {
-        Serial.println(" -> (Skipped: playlist maxed out at 40)");
       }
-    } else {
-      Serial.println(" -> (Skipped: not an .mp3 file)");
     }
-
     entry.close();
   }
   root.close();
-  Serial.printf("--- SD: scan complete, %d tracks found ---\n\n", trackCount);
-
   AUDIO_UNLOCK();
 }
 
@@ -673,14 +626,17 @@ void playTrack(int idx) {
   String path = trackList[idx];
   if (!path.startsWith("/")) path = "/" + path;
 
-  if (appState == STATE_SD_PLAYING) {
-    clearCoverBox();
-  }
-
+  coverCacheValid = false;
   AUDIO_LOCK();
+  if (SD.exists("/cover.jpg")) {
+    SD.remove("/cover.jpg"); 
+  }
   audio.connecttoFS(SD, path.c_str());
   AUDIO_UNLOCK();
 
+  if (appState == STATE_SD_PLAYING && !isDjMixerActive) {
+    clearCoverBox();
+  }
   isPlaying = true;
 }
 
@@ -688,6 +644,48 @@ int readSmoothedVolume() {
   int raw = analogRead(POT1_PIN);
   smoothVol = (smoothVol * 3 + raw) / 4;
   return map(smoothVol, 0, 4095, 0, 21);
+}
+
+int8_t mapEQ(int rawValue) {
+  if (rawValue < 1900) {
+    return map(rawValue, 0, 1900, -40, 0);   
+  } else if (rawValue > 2200) {
+    return map(rawValue, 2200, 4095, 0, 6);  
+  }
+  return 0; 
+}
+
+void updateDSP() {
+  smoothBass = (smoothBass * 3 + analogRead(POT2_PIN)) / 4;
+  smoothMid  = (smoothMid * 3  + analogRead(POT3_PIN)) / 4;
+  smoothHigh = (smoothHigh * 3 + analogRead(POT4_PIN)) / 4;
+  smoothBal  = (smoothBal * 3  + analogRead(POT5_PIN)) / 4;
+
+  if (millis() - lastDspTime < 30) return;
+  lastDspTime = millis();
+
+  int8_t bassGain = mapEQ(smoothBass);
+  int8_t midGain  = mapEQ(smoothMid);
+  int8_t highGain = mapEQ(smoothHigh);
+
+  int8_t balance = 0;
+  if (smoothBal < 1900) balance = map(smoothBal, 0, 1900, -16, 0);
+  else if (smoothBal > 2200) balance = map(smoothBal, 2200, 4095, 0, 16);
+
+  bool toneChanged = (bassGain != lastBassGain || midGain != lastMidGain || highGain != lastHighGain);
+  bool balChanged = (balance != lastBalance);
+
+  if (toneChanged || balChanged) {
+    AUDIO_LOCK();
+    if (toneChanged) audio.setTone(bassGain, midGain, highGain);
+    if (balChanged) audio.setBalance(balance);
+    AUDIO_UNLOCK();
+
+    lastBassGain = bassGain;
+    lastMidGain = midGain;
+    lastHighGain = highGain;
+    lastBalance = balance;
+  }
 }
 
 // ==========================================
@@ -701,6 +699,7 @@ void enterMenu() {
 }
 
 void enterSpotify() {
+  coverCacheValid = false;
   appState = STATE_SPOTIFY;
   screenNeedsFullDraw = true;
 }
@@ -737,9 +736,6 @@ void drawSpotifyStatic() {
   drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
   drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
 
-  // Force every field to redraw once on this fresh screen entry. Clearing
-  // the marquee's cached text makes marqueeSetText() treat it as brand new
-  // on the very next fast-cadence tick (within MARQUEE_STEP_MS).
   artistMarquee.text = "";
   trackMarquee.text = "";
   spotifyTransportDrawn = false;
@@ -756,19 +752,12 @@ void drawSpotifyDynamic() {
   int curSec = elapsedMs / 1000;
   int durSec = spotifyDurationMs / 1000;
 
-  // Time text genuinely changes every second, so it always redraws.
   char timeBuf[16];
   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", curSec / 60, curSec % 60, durSec / 60, durSec % 60);
   drawClearedText(INFO_X + 4, INFO_Y + 26, INFO_W - 8, timeBuf, COL_DIM, COL_PANEL);
 
-  // Artist + track name are drawn by the marquee updater in loop(), which
-  // runs on a much faster cadence than this once-a-second pass -- a smooth
-  // left-scroll needs to move a pixel or two far more often than 1x/sec.
-
-  // Progress bar also updates every second (that's the point of it).
   drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, curSec, durSec);
 
-  // Transport icons only redrawn when play/pause state actually flips.
   if (!spotifyTransportDrawn || spotifyIsPlaying != lastDrawnSpotifyPlaying) {
     lastDrawnSpotifyPlaying = spotifyIsPlaying;
     spotifyTransportDrawn = true;
@@ -777,11 +766,9 @@ void drawSpotifyDynamic() {
 
 void drawSDPlayerStatic() {
   drawCyberBackground();
-
-  // Force every field to redraw once on this fresh screen entry.
+  trackMarquee.text = "";
   lastDrawnSDTrackIndex = -1;
   sdTransportDrawn = false;
-  trackMarquee.text = "";
 
   if (!sdMounted) {
     tft.setTextSize(1);
@@ -791,8 +778,111 @@ void drawSDPlayerStatic() {
     return;
   }
 
-  drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
-  drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
+  if (!isDjMixerActive) {
+    drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
+    drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
+    drawCurrentSDCover(); 
+    
+    tft.setTextSize(1);
+    tft.setTextColor(COL_ACID);
+    tft.setCursor(120, 114);
+    tft.print("[MIDI]");
+    
+  } else {
+    for(int i=0; i<5; i++) lastDrawnSliders[i] = -1; 
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_MAGENTA);
+    tft.setCursor(4, 4);
+    tft.print("DJ MIXER");
+
+    tft.setTextColor(COL_DIM);
+    tft.setCursor(120, 4);
+    tft.print("[BACK]");
+
+    const char* labels[] = {"VOL", "BAS", "MID", "HIG", "PAN"};
+    for (int i = 0; i < 5; i++) {
+      int cx = 16 + i * 32; 
+      
+      tft.drawFastVLine(cx, 40, 60, COL_DIMMER);
+      tft.drawFastHLine(cx - 3, 40, 7, COL_DIMMER);
+      tft.drawFastHLine(cx - 3, 100, 7, COL_DIMMER);
+      
+      tft.setTextColor(COL_DIM);
+      int16_t bx, by; uint16_t bw, bh;
+      tft.getTextBounds(labels[i], 0, 0, &bx, &by, &bw, &bh);
+      tft.setCursor(cx - (bw / 2), 110);
+      tft.print(labels[i]);
+    }
+  }
+}
+
+void drawSDPlayerDynamic() {
+  if (!sdMounted) return;
+
+  AUDIO_LOCK();
+  bool running = audio.isRunning();
+  int cur = running ? audio.getAudioCurrentTime() : 0;
+  int dur = running ? audio.getAudioFileDuration() : 0;
+  AUDIO_UNLOCK();
+
+  if (!isDjMixerActive) {
+    tft.setTextSize(1);
+    if (currentTrackIndex != lastDrawnSDTrackIndex) {
+      char trkBuf[16];
+      snprintf(trkBuf, sizeof(trkBuf), "Track %d/%d", trackCount > 0 ? currentTrackIndex + 1 : 0, trackCount);
+      drawClearedText(INFO_X + 4, INFO_Y + 8, INFO_W - 8, trkBuf, COL_ACID, COL_PANEL);
+      lastDrawnSDTrackIndex = currentTrackIndex;
+    }
+
+    char timeBuf[16];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", cur / 60, cur % 60, dur / 60, dur % 60);
+    drawClearedText(INFO_X + 4, INFO_Y + 26, INFO_W - 8, timeBuf, COL_DIM, COL_PANEL);
+
+    int volPct = readSmoothedVolume();
+    char volBuf[16];
+    snprintf(volBuf, sizeof(volBuf), "Vol:%2d", volPct);
+    drawClearedText(INFO_X + 4, INFO_Y + 44, INFO_W - 8, volBuf, isPlaying ? COL_ACID : COL_MAGENTA, COL_PANEL);
+
+    drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, cur, dur);
+
+    if (!sdTransportDrawn || isPlaying != lastDrawnSDPlaying) {
+      lastDrawnSDPlaying = isPlaying;
+      sdTransportDrawn = true;
+    }
+
+  } else {
+    drawProgressBar(4, 25, 152, 4, cur, dur);
+
+    int volVal = map(smoothVol, 0, 4095, 0, 60);
+    int basVal = map(smoothBass, 0, 4095, 0, 60);
+    int midVal = map(smoothMid, 0, 4095, 0, 60);
+    int higVal = map(smoothHigh, 0, 4095, 0, 60);
+    int panVal = map(smoothBal, 0, 4095, 0, 60);
+
+    int currentVals[5] = {volVal, basVal, midVal, higVal, panVal};
+
+    for (int i = 0; i < 5; i++) {
+      if (currentVals[i] != lastDrawnSliders[i]) {
+        int cx = 16 + i * 32;
+        
+        if (lastDrawnSliders[i] != -1) {
+          int oldY = 100 - lastDrawnSliders[i];
+          tft.fillCircle(cx, oldY, 4, COL_BG_BOT); 
+          tft.drawFastVLine(cx, oldY - 4, 9, COL_DIMMER); 
+        }
+
+        int newY = 100 - currentVals[i];
+        tft.fillCircle(cx, newY, 4, COL_MAGENTA);
+        
+        if (i == 0 || i == 4) {
+          tft.fillCircle(cx, newY, 1, COL_ACID); 
+        }
+        
+        lastDrawnSliders[i] = currentVals[i];
+      }
+    }
+  }
 }
 
 void drawSDBrowseStatic() {
@@ -828,45 +918,6 @@ void drawSDBrowseList() {
   }
 }
 
-void drawSDPlayerDynamic() {
-  if (!sdMounted) return;
-  tft.setTextSize(1);
-
-  // Track number only changes when a new track starts, not every tick. The
-  // track name itself is drawn by the marquee updater in loop().
-  if (currentTrackIndex != lastDrawnSDTrackIndex) {
-    char trkBuf[16];
-    snprintf(trkBuf, sizeof(trkBuf), "Track %d/%d", trackCount > 0 ? currentTrackIndex + 1 : 0, trackCount);
-    drawClearedText(INFO_X + 4, INFO_Y + 8, INFO_W - 8, trkBuf, COL_ACID, COL_PANEL);
-    lastDrawnSDTrackIndex = currentTrackIndex;
-  }
-
-  AUDIO_LOCK();
-  bool running = audio.isRunning();
-  int cur = running ? audio.getAudioCurrentTime() : 0;
-  int dur = running ? audio.getAudioFileDuration() : 0;
-  AUDIO_UNLOCK();
-
-  // Time genuinely changes every second, so it always redraws.
-  char timeBuf[16];
-  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", cur / 60, cur % 60, dur / 60, dur % 60);
-  drawClearedText(INFO_X + 4, INFO_Y + 26, INFO_W - 8, timeBuf, COL_DIM, COL_PANEL);
-
-  // Volume can change any time the pot is turned, so it stays live too.
-  int volPct = readSmoothedVolume();
-  char volBuf[16];
-  snprintf(volBuf, sizeof(volBuf), "Vol:%2d", volPct);
-  drawClearedText(INFO_X + 4, INFO_Y + 44, INFO_W - 8, volBuf, isPlaying ? COL_ACID : COL_MAGENTA, COL_PANEL);
-
-  drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, cur, dur);
-
-  // Transport icons only redrawn when play/pause state actually flips.
-  if (!sdTransportDrawn || isPlaying != lastDrawnSDPlaying) {
-    lastDrawnSDPlaying = isPlaying;
-    sdTransportDrawn = true;
-  }
-}
-
 // ==========================================
 // 8. INPUT HANDLING
 // ==========================================
@@ -887,6 +938,7 @@ void handleEncoderSwitch() {
 
   if (encSwLastState == LOW && state == HIGH) {
     unsigned long heldFor = millis() - encSwPressStart;
+    
     if (!encSwLongTriggered && heldFor < LONG_PRESS_MS) {
       if (appState == STATE_MENU) {
         if (menuIndex == 0) enterSpotify();
@@ -894,6 +946,11 @@ void handleEncoderSwitch() {
       } else if (appState == STATE_SD_BROWSE && trackCount > 0) {
         currentTrackIndex = browseIndex % trackCount;
         appState = STATE_SD_PLAYING;
+        isDjMixerActive = false;
+        screenNeedsFullDraw = true;
+        playTrack(currentTrackIndex); 
+      } else if (appState == STATE_SD_PLAYING) {
+        isDjMixerActive = !isDjMixerActive;
         screenNeedsFullDraw = true;
       }
     }
@@ -951,42 +1008,49 @@ void handleSW1SW2() {
 // ==========================================
 void setup() {
   Serial.begin(115200);
+  
+  // Give peripherals time to settle before hitting them with data
+  delay(250); 
   while (!Serial) { delay(10); }
 
   audioMutex = xSemaphoreCreateRecursiveMutex();
+
+  // === WIFI INITIALIZATION REWRITE ===
+  // Start Wi-Fi FIRST to prevent voltage dips from crashing the radio.
+  // We explicitly force WIFI_STA and disconnect to clear any bugs stuck in the NVS memory.
+  Serial.println("\n--- Initializing Wi-Fi ---");
+  WiFi.mode(WIFI_STA); 
+  WiFi.disconnect(true);
+  delay(100);
+
+  wifiMulti.addAP(ssidHome, passHome);
+  wifiMulti.addAP(ssidHotspot, passHotspot);
+  
+  Serial.print("Scanning Wi-Fi");
+  while (wifiMulti.run() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWi-Fi Connected: " + WiFi.SSID());
+  client.setInsecure();
+  // ===================================
 
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
   pinMode(ENC_SW, INPUT_PULLUP);
   pinMode(SW1_PIN, INPUT_PULLUP);
   pinMode(SW2_PIN, INPUT_PULLUP);
+  
   analogReadResolution(12);
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
 
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
   initCyberPalette();
 
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setCursor(10, 10);
-  tft.print("Scanning Wi-Fi...");
-
-  wifiMulti.addAP(ssidHome, passHome);
-  wifiMulti.addAP(ssidHotspot, passHotspot);
-  while (wifiMulti.run() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWi-Fi Connected: " + WiFi.SSID());
-
-  client.setInsecure();
-
   spiSD.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
   sdMounted = SD.begin(SD_CS, spiSD, 4000000);
-  Serial.printf("SD: mount %s\n", sdMounted ? "OK" : "FAILED");
 
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(false);
@@ -1008,11 +1072,7 @@ void loop() {
   handleEncoderSwitch();
   handleSW1SW2();
 
-  // Lightweight heap watch. If minFreeHeap trends downward over a long
-  // session, that indicates fragmentation/leak worth investigating further;
-  // if it stays flat, string-allocation churn is not the culprit.
   if (millis() - lastHeapLog > 15000) {
-    Serial.printf("Free heap: %u  Min free heap ever: %u\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
     lastHeapLog = millis();
   }
 
@@ -1031,13 +1091,13 @@ void loop() {
           AUDIO_UNLOCK();
 
           if (progressive) {
-            Serial.println("Spotify cover is progressive JPEG -- skipping draw.");
             clearCoverBox();
           } else {
             clearCoverBox();
             AUDIO_LOCK();
             TJpgDec.setJpgScale(1);
             TJpgDec.drawFsJpg(SPOTIFY_IMG_X, SPOTIFY_IMG_Y, "/spoty.jpg", SD);
+            coverCacheValid = true; 
             AUDIO_UNLOCK();
           }
         }
@@ -1054,11 +1114,10 @@ void loop() {
     AUDIO_LOCK();
     audio.setVolume(vol);
     AUDIO_UNLOCK();
+    
+    updateDSP(); 
   }
 
-  // Marquee scrolling runs on its own fast cadence, independent of the
-  // once-a-second field refresh below -- a smooth left-scroll needs to
-  // move a pixel or two far more often than 1x/sec to not look choppy.
   if (millis() - lastMarqueeTime > MARQUEE_STEP_MS) {
     lastMarqueeTime = millis();
     if (appState == STATE_SPOTIFY) {
@@ -1072,8 +1131,14 @@ void loop() {
       if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
         name = name.substring(0, name.length() - 4);
       }
-      marqueeSetText(trackMarquee, name, NAME_W - 4, COL_ACID, COL_BG_BOT);
-      marqueeDraw(trackMarquee, NAME_X, NAME_Y, COL_BG_BOT);
+      
+      if (!isDjMixerActive) {
+        marqueeSetText(trackMarquee, name, NAME_W - 4, COL_ACID, COL_BG_BOT);
+        marqueeDraw(trackMarquee, NAME_X, NAME_Y, COL_BG_BOT);
+      } else {
+        marqueeSetText(trackMarquee, name, 152, COL_ACID, COL_BG_BOT);
+        marqueeDraw(trackMarquee, 4, 15, COL_BG_BOT);
+      }
     }
   }
 
@@ -1111,18 +1176,24 @@ void loop() {
     if (screenNeedsFullDraw) {
       drawSDPlayerStatic();
       screenNeedsFullDraw = false;
-      playTrack(currentTrackIndex);
     }
   }
 
-  // Was 200ms (5Hz) -- nothing shown on these screens changes faster than
-  // once a second, so redrawing 5x more often than needed was the main
-  // source of the "constantly refreshing" feeling. Combined with the
-  // change-detection above, this now redraws once a second and skips
-  // fields that haven't actually changed.
-  if (millis() - lastUITime > 1000) {
-    if (appState == STATE_SPOTIFY) drawSpotifyDynamic();
-    else if (appState == STATE_SD_PLAYING) drawSDPlayerDynamic();
-    lastUITime = millis();
+  if (appState == STATE_SD_PLAYING) {
+    if (isDjMixerActive && millis() - lastUITime > 30) {
+      drawSDPlayerDynamic();
+      lastUITime = millis();
+    } else if (!isDjMixerActive && millis() - lastUITime > 1000) {
+      drawSDPlayerDynamic();
+      lastUITime = millis();
+    }
+  }
+
+  static unsigned long lastSpotifyUITime = 0;
+  if (millis() - lastSpotifyUITime > 1000) {
+    if (appState == STATE_SPOTIFY) {
+      drawSpotifyDynamic();
+    }
+    lastSpotifyUITime = millis();
   }
 }
