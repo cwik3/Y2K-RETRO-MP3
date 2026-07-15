@@ -25,7 +25,7 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define TFT_MOSI 11
 #define TFT_RST  14  
 #define TFT_CS   10
-#define TFT_DC   13  // <--- Moved to safe, completely conflict-free GPIO 21
+#define TFT_DC   13  
 
 
 
