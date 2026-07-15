@@ -12,7 +12,7 @@
 #include "secrets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-
+#include <HTTPClient.h> 
 
 WiFiMulti wifiMulti;
 WiFiClientSecure client;
@@ -47,66 +47,124 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define POT2_PIN 2
 
 // ==========================================
+// 2b. DASHBOARD LAYOUT CONSTANTS
+// ==========================================
+#define COVER_X 4
+#define COVER_Y 4
+#define COVER_W 70
+#define COVER_H 70
+
+#define INFO_X (COVER_X + COVER_W + 4)
+#define INFO_Y COVER_Y
+#define INFO_W (160 - INFO_X - 4)
+#define INFO_H COVER_H
+
+#define NAME_X COVER_X
+#define NAME_Y (COVER_Y + COVER_H + 14)        // 78
+#define NAME_W (160 - (COVER_X * 2))          // 152
+
+#define PROGRESS_X COVER_X
+#define PROGRESS_Y (NAME_Y + 18)              // a bit more breathing room under the name row
+#define PROGRESS_W (160 - (COVER_X * 2))      // 152
+#define PROGRESS_H 4
+
+
+#define COVER_CLIP_MINX (COVER_X + 1)
+#define COVER_CLIP_MAXX (COVER_X + COVER_W - 2)
+#define COVER_CLIP_MINY (COVER_Y + 1)
+#define COVER_CLIP_MAXY (COVER_Y + COVER_H - 2)
+
+#define SPOTIFY_IMG_X (COVER_X + 1 + ((COVER_W - 2 - 64) / 2))
+#define SPOTIFY_IMG_Y (COVER_Y + 1 + ((COVER_H - 2 - 64) / 2))
+
+// Fixed row height used to clear a text row before redrawing it (text size 1
+// glyphs are 8px tall in this font). Used instead of concatenating trailing
+// spaces onto Strings every redraw, which was creating a fresh heap
+// allocation ~5x/second and slowly fragmenting the heap over long sessions.
+#define TEXT_ROW_H 9
+
+// ==========================================
 // 3. GLOBAL OBJECTS & STATE
 // ==========================================
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 SPIClass spiSD(HSPI);
 Audio audio;
 
-// The Audio library is NOT thread-safe. audio.loop() runs continuously on
-// core 0 (audioTask below). Any other code (running on core 1, i.e. the
-// main Arduino loop()) that touches the `audio` object -- connecttoFS,
-// pauseResume, setVolume, isRunning, getAudioCurrentTime, etc. -- MUST take
-// this mutex first, or you get corrupted internal buffer state and a
-// crash/reboot (exactly the "Can't stuff any more in I2S" + Guru Meditation
-// you were seeing). It's recursive because audio_eof_mp3() is called BY
-// audio.loop() itself (already holding the mutex) and also needs to call
-// connecttoFS().
+// This mutex now guards BOTH audio.loop() AND any direct SD-card access
+// (SD.open/openNextFile/File::read/write, TJpgDec draws from SD) made from
+// the main loop/core 1. audioTask runs pinned to core 0 and shares the same
+// physical SPI bus/SD card with everything the main loop does on core 1;
+// without a shared lock, concurrent SPI transactions from both cores can
+// corrupt in-flight reads and crash the chip. It's recursive so nested
+// locking (e.g. playTrack() called while already holding the lock) is safe.
 SemaphoreHandle_t audioMutex;
 #define AUDIO_LOCK()   xSemaphoreTakeRecursive(audioMutex, portMAX_DELAY)
 #define AUDIO_UNLOCK() xSemaphoreGiveRecursive(audioMutex)
 
 volatile int encoderValue = 0;
 unsigned long lastUITime = 0;
+unsigned long lastMarqueeTime = 0;
 unsigned long lastSpotifyCheck = 0;
+unsigned long lastHeapLog = 0;
 
 String currentTrack = "Waiting...";
 String currentArtist = "Spotify API";
 bool spotifyIsPlaying = false;
 
+long spotifyProgressMs = 0;
+long spotifyDurationMs = 0;
+unsigned long spotifyProgressCapturedAt = 0;
+
+void playTrack(int idx);
+void clearCoverBox();
+bool jpegIsProgressive(File &f);
+
 enum AppState { STATE_MENU, STATE_SPOTIFY, STATE_SD_BROWSE, STATE_SD_PLAYING };
 AppState appState = STATE_MENU;
 
 int browseIndex = 0;
-bool screenNeedsFullDraw = true; // true only when entering a state: draw background+static chrome
-bool listNeedsRedraw = true;     // true whenever just the scrolling list/buttons need repainting
-bool sdMounted = false;          // set from SD.begin() result in setup()
+bool screenNeedsFullDraw = true;
+bool listNeedsRedraw = true;
+bool sdMounted = false;
 
-// --- Menu ---
 const char* menuItems[] = { "SPOTIFY STATUS", "SD CARD PLAYER" };
 const int MENU_COUNT = 2;
 int menuIndex = 0;
 int lastMenuEncoderValue = 0;
-const int ENCODER_STEPS_PER_CLICK = 2; // KY-040 modules vary 2-4, tune if too sensitive/sluggish
+const int ENCODER_STEPS_PER_CLICK = 2;
 
-// --- Encoder switch (short = select, long = back) ---
 bool encSwLastState = HIGH;
 unsigned long encSwPressStart = 0;
 bool encSwLongTriggered = false;
 const unsigned long LONG_PRESS_MS = 700;
 
-// --- SW1/SW2 debounce ---
 bool sw1LastState = HIGH;
 bool sw2LastState = HIGH;
 unsigned long lastButtonAction = 0;
 const unsigned long BUTTON_DEBOUNCE = 250;
+String currentSpotifyUrl = "";
+String lastSpotifyUrl = "none";
 
-// --- SD player ---
 String trackList[40];
 int trackCount = 0;
 int currentTrackIndex = 0;
 bool isPlaying = true;
-int smoothVol = 0; // EMA state for volume pot smoothing
+int smoothVol = 0;
+
+// Tracks what's currently on screen so dynamic redraws can skip fields
+// that haven't changed, instead of clearing+reprinting everything every
+// tick -- this is what was making the screen feel like it was constantly
+// flickering/refreshing. Time/volume use plain char buffers (no String
+// allocation) since they're compared on every tick.
+char lastDrawnSpotifyTimeBuf[16] = "";
+bool lastDrawnSpotifyPlaying = true;
+bool spotifyTransportDrawn = false;
+
+int lastDrawnSDTrackIndex = -1;
+char lastDrawnSDTimeBuf[16] = "";
+char lastDrawnSDVolBuf[16] = "";
+bool lastDrawnSDPlaying = true;
+bool sdTransportDrawn = false;
 
 // ==========================================
 // 4. Y2K / CYBERSIGIL DRAW HELPERS
@@ -161,9 +219,6 @@ void drawSigilCorners(int x, int y, int w, int h, uint16_t color) {
   tft.drawFastVLine(x + w - 1, y + h - 2, t, color);
 }
 
-// Trims `text` (stripping a trailing ".mp3" first) so its rendered pixel
-// width fits within maxWidth at the current text size, appending "..." if
-// it had to cut anything. Fixes long filenames overflowing button bounds.
 String truncateToWidth(const String &text, int maxWidth) {
   String label = text;
   if (label.endsWith(".mp3") || label.endsWith(".MP3")) {
@@ -184,21 +239,29 @@ String truncateToWidth(const String &text, int maxWidth) {
   return ellipsis;
 }
 
-void drawGlassButton(int x, int y, int w, int h, const char* label, bool selected) {
+// Draws text after clearing its row with a solid fillRect first. Replaces
+// the old "text + a bunch of trailing spaces" trick, which allocated a new
+// String on the heap on every single redraw (5x/sec while a screen is
+// active) purely to blank out leftover pixels from a longer previous string.
+void drawClearedText(int x, int y, int w, const String &text, uint16_t fg, uint16_t bg) {
+  tft.fillRect(x, y, w, TEXT_ROW_H, bg);
+  tft.setTextColor(fg, bg);
+  tft.setCursor(x, y);
+  tft.print(text);
+}
+
+void drawGlassButton(int x, int y, int w, int h, const char* label, bool selected, int hPad = 8) {
   uint16_t fill   = selected ? tft.color565(16, 10, 26) : tft.color565(8, 5, 14);
   uint16_t border = selected ? COL_ACID : COL_DIMMER;
 
   tft.fillRect(x, y, w, h, fill);
   tft.drawRect(x, y, w, h, border);
-  tft.drawFastHLine(x + 2, y + 2, w - 4, selected ? COL_MAGENTA : COL_DIMMER);
-  drawSigilCorners(x, y, w, h, selected ? COL_ACID : COL_DIMMER);
+  drawSigilCorners(x, y, w, h, border);
 
   tft.setTextSize(1);
   tft.setTextColor(selected ? COL_ACID : COL_DIM, fill);
 
-  // Clip the label to the button's interior width before centering it, so
-  // long filenames get a "..." instead of spilling past the border.
-  int maxTextWidth = w - 10;
+  int maxTextWidth = w - hPad;
   String clipped = truncateToWidth(String(label), maxTextWidth);
 
   int16_t bx, by; uint16_t bw, bh;
@@ -207,10 +270,125 @@ void drawGlassButton(int x, int y, int w, int h, const char* label, bool selecte
   tft.print(clipped);
 }
 
+// Cover/info panels: flat fill only now, no border or corner accents.
 void drawGlassPanel(int x, int y, int w, int h) {
   tft.fillRect(x, y, w, h, COL_PANEL);
-  tft.drawRect(x, y, w, h, COL_PANEL_BORDER);
-  drawSigilCorners(x, y, w, h, COL_MAGENTA);
+}
+
+void drawProgressBar(int x, int y, int w, int h, int curSec, int durSec) {
+  tft.drawRect(x, y, w, h, COL_DIMMER);
+  // Always clear the interior first. Previously only the new fillW was
+  // drawn, so skipping to a shorter/newer track never erased the leftover
+  // fill from the longer previous track -- that's the "bar doesn't reset"
+  // bug after switching songs.
+  tft.fillRect(x + 1, y + 1, w - 2, h - 2, COL_PANEL);
+  if (durSec > 0) {
+    int fillW = map(constrain(curSec, 0, durSec), 0, durSec, 0, w - 2);
+    tft.fillRect(x + 1, y + 1, fillW, h - 2, COL_ACID);
+  }
+}
+
+
+
+// ==========================================
+// 4b. MARQUEE (SCROLLING TEXT) HELPERS
+// ==========================================
+// Adafruit_GFX has no built-in clip rect for text, so a naive scroll would
+// bleed pixels outside the box into whatever is drawn next to it. To get a
+// real clip, the full string is rendered once into an off-screen 16-bit
+// canvas, and each frame just blits a boxW-wide *slice* of that canvas to
+// the screen at the current scroll offset -- no text re-rendering, and no
+// per-frame heap allocation, on every scroll step.
+struct Marquee {
+  GFXcanvas16 *canvas;
+  String text;          // text currently rendered into canvas (cache key)
+  int textPixelW = 0;   // pixel width of that text
+  int boxW = 0;          // width of the destination box on screen
+  int scrollX = 0;
+  bool scrolling = false;
+  unsigned long lastStep = 0;
+  unsigned long pauseUntil = 0;
+  Marquee(GFXcanvas16 *c) : canvas(c) {}
+};
+
+const unsigned long MARQUEE_STEP_MS = 40;   // how often the scroll advances
+const unsigned long MARQUEE_PAUSE_MS = 1000; // pause at the start of each loop
+const int MARQUEE_GAP_PX = 16;               // blank gap before the text repeats
+
+// 260px covers roughly 40-45 characters at text size 1 -- plenty for a
+// track/artist name. Allocated once at startup and reused for the life of
+// the program, so scrolling never touches the heap.
+GFXcanvas16 artistCanvasBuf(260, TEXT_ROW_H);
+GFXcanvas16 trackCanvasBuf(260, TEXT_ROW_H);
+Marquee artistMarquee(&artistCanvasBuf);
+Marquee trackMarquee(&trackCanvasBuf);
+
+// Re-renders the canvas ONLY when the text actually changed (new song /
+// artist / filename). boxW is the width available on screen; if the text
+// is wider than that, it's flagged to scroll and a second copy is drawn
+// after a gap so the loop wraps without a visible jump.
+void marqueeSetText(Marquee &m, const String &text, int boxW, uint16_t fg, uint16_t bg) {
+  m.boxW = boxW;
+  if (text == m.text) return;
+  m.text = text;
+  m.scrollX = 0;
+  m.lastStep = millis();
+  m.pauseUntil = millis() + MARQUEE_PAUSE_MS;
+
+  tft.setTextSize(1);
+  int16_t bx, by; uint16_t bw, bh;
+  tft.getTextBounds(text, 0, 0, &bx, &by, &bw, &bh);
+  m.textPixelW = bw;
+  m.scrolling = (int)bw > boxW;
+
+  int canvasW = m.canvas->width();
+  m.canvas->fillScreen(bg);
+  m.canvas->setTextColor(fg);
+  m.canvas->setTextSize(1);
+  m.canvas->setCursor(0, 1);
+  m.canvas->print(text);
+
+  if (m.scrolling) {
+    int secondX = (int)bw + MARQUEE_GAP_PX;
+    if (secondX + (int)bw <= canvasW) {
+      m.canvas->setCursor(secondX, 1);
+      m.canvas->print(text);
+    }
+  }
+}
+
+// Blits the currently visible boxW-wide slice of the canvas to (x,y) and
+// advances the scroll offset if it's time to step. Call this frequently
+// (much faster than the once-a-second field refresh) for a smooth scroll.
+void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
+  static uint16_t sliceBuf[300];
+  int boxW = m.boxW;
+  if (boxW <= 0) return;
+  if (boxW > (int)(sizeof(sliceBuf) / sizeof(sliceBuf[0]))) {
+    boxW = sizeof(sliceBuf) / sizeof(sliceBuf[0]);
+  }
+
+  if (m.scrolling && millis() > m.pauseUntil && millis() - m.lastStep > MARQUEE_STEP_MS) {
+    m.lastStep = millis();
+    m.scrollX++;
+    int wrapPoint = m.textPixelW + MARQUEE_GAP_PX;
+    if (m.scrollX >= wrapPoint) {
+      m.scrollX = 0;
+      m.pauseUntil = millis() + MARQUEE_PAUSE_MS;
+    }
+  }
+
+  uint16_t *buf = m.canvas->getBuffer();
+  int canvasW = m.canvas->width();
+  int srcStart = m.scrolling ? m.scrollX : 0;
+
+  for (int row = 0; row < TEXT_ROW_H; row++) {
+    for (int col = 0; col < boxW; col++) {
+      int srcCol = srcStart + col;
+      sliceBuf[col] = (srcCol >= 0 && srcCol < canvasW) ? buf[row * canvasW + srcCol] : bg;
+    }
+    tft.drawRGBBitmap(x, y + row, sliceBuf, boxW, 1);
+  }
 }
 
 // ==========================================
@@ -218,7 +396,26 @@ void drawGlassPanel(int x, int y, int w, int h) {
 // ==========================================
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (y >= tft.height()) return 0;
-  tft.drawRGBBitmap(x, y, bitmap, w, h);
+
+  int minX = COVER_CLIP_MINX, maxX = COVER_CLIP_MAXX;
+  int minY = COVER_CLIP_MINY, maxY = COVER_CLIP_MAXY;
+
+  if (x > maxX || y > maxY || x + w - 1 < minX || y + h - 1 < minY) return 1;
+
+  if (x >= minX && x + w - 1 <= maxX && y >= minY && y + h - 1 <= maxY) {
+    tft.drawRGBBitmap(x, y, bitmap, w, h);
+    return 1;
+  }
+
+  for (int j = 0; j < h; j++) {
+    for (int i = 0; i < w; i++) {
+      int px = x + i;
+      int py = y + j;
+      if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
+        tft.drawPixel(px, py, bitmap[j * w + i]);
+      }
+    }
+  }
   return 1;
 }
 
@@ -239,71 +436,246 @@ void audioTask(void *parameter) {
   }
 }
 
-// Legacy weak-symbol callback: library calls this by name on file end.
-// NOTE: this runs on core 0, called synchronously from inside audio.loop(),
-// which means audioTask already holds audioMutex. That's exactly why the
-// mutex must be recursive -- this take/give pair just re-enters it safely.
 void audio_eof_mp3(const char *info) {
   if (appState == STATE_SD_PLAYING && trackCount > 0) {
-    AUDIO_LOCK();
-    currentTrackIndex = (currentTrackIndex + 1) % trackCount;
-    String path = trackList[currentTrackIndex];
-    if (!path.startsWith("/")) path = "/" + path;
-    audio.connecttoFS(SD, path.c_str());
-    isPlaying = true;
-    AUDIO_UNLOCK();
+    playTrack(currentTrackIndex + 1);
   }
+}
+
+// Quick-and-dirty progressive-vs-baseline JPEG check. TJpg_Decoder can ONLY
+// decode baseline sequential JPEGs -- it silently fails on progressive
+// JPEGs, leaving some MCU blocks undrawn (black). This scans for the SOF
+// marker: 0xFFC0/0xFFC1 = baseline, 0xFFC2 (and friends) = progressive.
+// NOTE: callers must already hold AUDIO_LOCK, since this does SD reads.
+bool jpegIsProgressive(File &f) {
+  f.seek(0);
+  uint8_t buf[512];
+  size_t totalRead = 0;
+  const size_t maxScan = 8192;
+  uint8_t prev = 0;
+
+  while (totalRead < maxScan) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    for (int i = 0; i < n; i++) {
+      uint8_t b = buf[i];
+      if (prev == 0xFF) {
+        if (b == 0xC2 || b == 0xC6 || b == 0xCA || b == 0xCE) return true;
+        if (b == 0xC0 || b == 0xC1) return false;
+      }
+      prev = b;
+    }
+    totalRead += n;
+  }
+  return false;
+}
+
+// Called synchronously from inside audio.loop() during ID3 parsing, which
+// itself already runs under AUDIO_LOCK inside audioTask -- so this already
+// has exclusive SD access. The explicit lock/unlock here is added anyway
+// for safety since the mutex is recursive, in case this ever gets invoked
+// from a different call path in the future.
+void audio_id3image(File& file, const size_t pos, const size_t size) {
+  Serial.printf("ID3 Image found! Size: %d bytes\n", size);
+
+  AUDIO_LOCK();
+
+  File cover = SD.open("/cover.jpg", FILE_WRITE);
+  if (cover) {
+    uint32_t currentPos = file.position(); 
+    file.seek(pos);
+
+    uint8_t buffer[2048];
+    size_t bytesLeft = size;
+    while (bytesLeft > 0) {
+      size_t bytesToRead = (bytesLeft < sizeof(buffer)) ? bytesLeft : sizeof(buffer);
+      file.read(buffer, bytesToRead);
+      cover.write(buffer, bytesToRead);
+      bytesLeft -= bytesToRead;
+    }
+    cover.close();
+    file.seek(currentPos);
+
+    File check = SD.open("/cover.jpg");
+    bool progressive = check && jpegIsProgressive(check);
+    if (check) check.close();
+
+    if (progressive) {
+      Serial.println("Embedded cover is a progressive JPEG -- decoder can't handle it, skipping draw.");
+      clearCoverBox();
+      AUDIO_UNLOCK();
+      return;
+    }
+
+    uint16_t imgW = 0, imgH = 0;
+    TJpgDec.getFsJpgSize(&imgW, &imgH, "/cover.jpg", SD);
+
+    const int maxDim = COVER_W - 2;
+    int scale = 1;
+    while ((imgW / scale > maxDim) || (imgH / scale > maxDim)) {
+      scale *= 2;
+      if (scale >= 8) break; 
+    }
+    TJpgDec.setJpgScale(scale);
+
+    int scaledW = imgW / scale;
+    int scaledH = imgH / scale;
+    int dX = COVER_CLIP_MINX + (maxDim - scaledW) / 2;
+    int dY = COVER_CLIP_MINY + (maxDim - scaledH) / 2;
+
+    TJpgDec.drawFsJpg(dX, dY, "/cover.jpg", SD);
+  } else {
+    Serial.println("Failed to create temp cover file.");
+  }
+
+  AUDIO_UNLOCK();
 }
 
 void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
   if (currentlyPlaying.isPlaying) {
     currentTrack = String(currentlyPlaying.trackName);
-    currentArtist = String(currentlyPlaying.artists[0].artistName);
+
+    // Guard against zero-artist responses (podcasts, local files, some
+    // compilation tracks). Indexing artists[0] unconditionally here was
+    // reading an uninitialized pointer inside the library's response buffer
+    // whenever numArtists was 0, which is exactly what produced the
+    // LoadProhibited crash at EXCVADDR 0x00000001.
+    if (currentlyPlaying.numArtists > 0) {
+      currentArtist = String(currentlyPlaying.artists[0].artistName);
+    } else {
+      currentArtist = "Unknown Artist";
+    }
+
     spotifyIsPlaying = true;
+
+    spotifyProgressMs = currentlyPlaying.progressMs;
+    spotifyDurationMs = currentlyPlaying.durationMs;
+    spotifyProgressCapturedAt = millis();
+
+    if (currentlyPlaying.numImages > 0) {
+      currentSpotifyUrl = String(currentlyPlaying.albumImages[currentlyPlaying.numImages - 1].url);
+    } else {
+      currentSpotifyUrl = "";
+    }
   } else {
     currentTrack = "Nothing playing";
     currentArtist = "on Spotify";
     spotifyIsPlaying = false;
+    currentSpotifyUrl = "";
+    spotifyProgressMs = 0;
+    spotifyDurationMs = 0;
   }
+}
+
+// NOTE: caller must hold AUDIO_LOCK around the SD-writing portion of this.
+// The lock is taken internally here, around just the file open/write span,
+// rather than around the whole HTTP GET -- holding it for the entire
+// network transfer would stall SD-audio playback for as long as the
+// download takes. Locking only the SD write still fully protects against
+// SPI bus corruption, at the cost of a much shorter, bounded stall.
+bool downloadSpotifyCover(String url) {
+  if (url == "" || !sdMounted) return false;
+
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    int expectedLen = http.getSize();
+
+    AUDIO_LOCK();
+    File file = SD.open("/spoty.jpg", FILE_WRITE);
+    if (file) {
+      int written = http.writeToStream(&file);
+      file.close();
+      AUDIO_UNLOCK();
+      http.end();
+
+      if (expectedLen > 0 && written != expectedLen) {
+        Serial.printf("Cover download incomplete: got %d of %d bytes, skipping decode\n",
+                      written, expectedLen);
+        return false;
+      }
+      return true;
+    }
+    AUDIO_UNLOCK();
+  }
+  http.end();
+  return false;
 }
 
 // ==========================================
 // 6. SD CARD TRACK LIST
 // ==========================================
 void scanSDTracks() {
+  AUDIO_LOCK();
+
   trackCount = 0;
   File root = SD.open("/");
   if (!root) {
     Serial.println("SD: failed to open root directory");
+    AUDIO_UNLOCK();
     return;
   }
+
+  Serial.println("\n--- SD CARD SCAN START ---");
+
   while (true) {
     File entry = root.openNextFile();
     if (!entry) break;
-    String name = entry.name();
+
+    String name = String(entry.name());
+    Serial.printf("Saw file/folder: %s ", name.c_str());
+
+    if (entry.isDirectory()) {
+      Serial.println(" -> (Skipped: is a folder)");
+      entry.close();
+      continue;
+    }
+
     String lower = name;
     lower.toLowerCase();
-    bool isJunk = name.startsWith(".") || name.startsWith("._");
-    if (!entry.isDirectory() && lower.endsWith(".mp3") && !isJunk && trackCount < 40) {
-      trackList[trackCount] = name;
-      trackCount++;
-      Serial.printf("SD: found track [%d] %s\n", trackCount - 1, name.c_str());
+
+    if (lower.indexOf("._") != -1 || lower.indexOf("/.") != -1 || lower.indexOf("system") != -1) {
+      Serial.println(" -> (Skipped: hidden system file)");
+      entry.close();
+      continue;
     }
+
+    if (lower.endsWith(".mp3")) {
+      if (trackCount < 40) {
+        trackList[trackCount] = name;
+        trackCount++;
+        Serial.println(" -> (ADDED TO PLAYLIST!)");
+      } else {
+        Serial.println(" -> (Skipped: playlist maxed out at 40)");
+      }
+    } else {
+      Serial.println(" -> (Skipped: not an .mp3 file)");
+    }
+
     entry.close();
   }
   root.close();
-  Serial.printf("SD: scan complete, %d tracks found\n", trackCount);
+  Serial.printf("--- SD: scan complete, %d tracks found ---\n\n", trackCount);
+
+  AUDIO_UNLOCK();
 }
 
-// Called from core 1 (main loop / button handlers). Must take audioMutex
-// before touching `audio`, since audioTask on core 0 is calling audio.loop()
-// continuously and connecttoFS() is not safe to call concurrently with it.
+void clearCoverBox() {
+  tft.fillRect(COVER_X, COVER_Y, COVER_W, COVER_H, COL_PANEL);
+}
+
 void playTrack(int idx) {
   if (trackCount == 0) return;
   idx = ((idx % trackCount) + trackCount) % trackCount;
   currentTrackIndex = idx;
   String path = trackList[idx];
   if (!path.startsWith("/")) path = "/" + path;
+
+  if (appState == STATE_SD_PLAYING) {
+    clearCoverBox();
+  }
 
   AUDIO_LOCK();
   audio.connecttoFS(SD, path.c_str());
@@ -314,7 +686,7 @@ void playTrack(int idx) {
 
 int readSmoothedVolume() {
   int raw = analogRead(POT1_PIN);
-  smoothVol = (smoothVol * 3 + raw) / 4; // simple EMA to kill ADC jitter
+  smoothVol = (smoothVol * 3 + raw) / 4;
   return map(smoothVol, 0, 4095, 0, 21);
 }
 
@@ -334,11 +706,11 @@ void enterSpotify() {
 }
 
 void enterSDPlayer() {
-  appState = STATE_SD_BROWSE; // start in browse mode, not auto-playing
+  appState = STATE_SD_BROWSE;
   screenNeedsFullDraw = true;
   listNeedsRedraw = true;
   browseIndex = 0;
-  lastMenuEncoderValue = encoderValue; // resync so browse list doesn't jump
+  lastMenuEncoderValue = encoderValue;
   if (trackCount == 0) scanSDTracks();
 }
 
@@ -351,7 +723,6 @@ void drawMenuStatic() {
   tft.setTextSize(1);
   tft.setTextColor(COL_DIM);
   tft.setCursor(10, 112);
-  tft.print("Turn: select   Click: enter");
 }
 
 void drawMenuButtons() {
@@ -363,67 +734,67 @@ void drawMenuButtons() {
 
 void drawSpotifyStatic() {
   drawCyberBackground();
-  tft.setTextSize(1);
-  tft.setTextColor(COL_MAGENTA);
-  tft.setCursor(4, 4);
-  tft.print("SPOTIFY STATUS");
-  drawGlassPanel(8, 18, 144, 60);
-  tft.setCursor(4, 100);
-  tft.setTextColor(COL_DIM);
-  tft.print("SW1:Skip SW2:Play/Pause");
-  tft.setCursor(4, 112);
-  tft.print("Hold Enc: Back to menu");
+  drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
+  drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
+
+  // Force every field to redraw once on this fresh screen entry. Clearing
+  // the marquee's cached text makes marqueeSetText() treat it as brand new
+  // on the very next fast-cadence tick (within MARQUEE_STEP_MS).
+  artistMarquee.text = "";
+  trackMarquee.text = "";
+  spotifyTransportDrawn = false;
 }
 
 void drawSpotifyDynamic() {
   tft.setTextSize(1);
-  tft.setTextColor(COL_ACID, COL_PANEL);
-  tft.setCursor(14, 26);
-  tft.print(currentTrack.substring(0, 22) + "               ");
 
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.setCursor(14, 42);
-  tft.print(currentArtist.substring(0, 22) + "               ");
+  long elapsedMs = spotifyProgressMs;
+  if (spotifyIsPlaying) {
+    elapsedMs += (long)(millis() - spotifyProgressCapturedAt);
+  }
+  elapsedMs = constrain(elapsedMs, 0, spotifyDurationMs);
+  int curSec = elapsedMs / 1000;
+  int durSec = spotifyDurationMs / 1000;
 
-  tft.setTextColor(spotifyIsPlaying ? COL_ACID : COL_MAGENTA, COL_PANEL);
-  tft.setCursor(14, 60);
-  tft.print(spotifyIsPlaying ? "> PLAYING   " : "|| PAUSED    ");
-}
+  // Time text genuinely changes every second, so it always redraws.
+  char timeBuf[16];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", curSec / 60, curSec % 60, durSec / 60, durSec % 60);
+  drawClearedText(INFO_X + 4, INFO_Y + 26, INFO_W - 8, timeBuf, COL_DIM, COL_PANEL);
 
-void drawSDProgressBar(int cur, int dur) {
-  int barX = 14, barY = 96, barW = 128, barH = 4;
-  tft.drawRect(barX, barY, barW, barH, COL_DIMMER);
-  if (dur > 0) {
-    int fillW = map(constrain(cur, 0, dur), 0, dur, 0, barW - 2);
-    tft.fillRect(barX + 1, barY + 1, fillW, barH - 2, COL_ACID);
+  // Artist + track name are drawn by the marquee updater in loop(), which
+  // runs on a much faster cadence than this once-a-second pass -- a smooth
+  // left-scroll needs to move a pixel or two far more often than 1x/sec.
+
+  // Progress bar also updates every second (that's the point of it).
+  drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, curSec, durSec);
+
+  // Transport icons only redrawn when play/pause state actually flips.
+  if (!spotifyTransportDrawn || spotifyIsPlaying != lastDrawnSpotifyPlaying) {
+    lastDrawnSpotifyPlaying = spotifyIsPlaying;
+    spotifyTransportDrawn = true;
   }
 }
 
 void drawSDPlayerStatic() {
   drawCyberBackground();
-  tft.setTextSize(1);
-  tft.setTextColor(COL_MAGENTA);
-  tft.setCursor(4, 4);
-  tft.print("SD CARD PLAYER");
+
+  // Force every field to redraw once on this fresh screen entry.
+  lastDrawnSDTrackIndex = -1;
+  sdTransportDrawn = false;
+  trackMarquee.text = "";
 
   if (!sdMounted) {
+    tft.setTextSize(1);
     tft.setTextColor(COL_MAGENTA);
-    tft.setCursor(4, 50);
+    tft.setCursor(4, 40);
     tft.print("SD CARD NOT DETECTED");
-    tft.setCursor(4, 112);
-    tft.setTextColor(COL_DIM);
-    tft.print("Hold Enc: Back to menu");
     return;
   }
 
-  drawGlassPanel(8, 18, 144, 40);   // track name
-  drawGlassPanel(8, 62, 144, 40);   // time / state / volume
-  tft.setCursor(4, 116);
-  tft.setTextColor(COL_DIM);
-  tft.print("SW1:Next  SW2:Play/Pause  Hold Enc:Back");
+  drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
+  drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
 }
 
-// Background + header only -- painted ONCE when entering the browse screen.
 void drawSDBrowseStatic() {
   drawCyberBackground();
   tft.setTextSize(1);
@@ -432,13 +803,8 @@ void drawSDBrowseStatic() {
   tft.print("SELECT TRACK");
   tft.setTextColor(COL_DIM);
   tft.setCursor(4, 116);
-  tft.print("Hold Enc: Back to menu");
 }
 
-// Just the scrolling list of buttons -- this is what gets repainted on every
-// encoder tick. No background redraw here, which is what was causing the
-// flicker/clunkiness: drawGlassButton() already fills its own rect, so
-// repainting just the rows is enough to keep it visually clean.
 void drawSDBrowseList() {
   if (!sdMounted) {
     tft.setTextColor(COL_MAGENTA);
@@ -457,7 +823,7 @@ void drawSDBrowseList() {
   int visible = trackCount < 4 ? trackCount : 4;
   for (int i = 0; i < visible; i++) {
     int idx = (browseIndex + i) % trackCount;
-    bool isSelected = (i == 0); // top row = current selection
+    bool isSelected = (i == 0);
     drawGlassButton(8, startY + (i * 26), 144, 22, trackList[idx].c_str(), isSelected);
   }
 }
@@ -465,12 +831,15 @@ void drawSDBrowseList() {
 void drawSDPlayerDynamic() {
   if (!sdMounted) return;
   tft.setTextSize(1);
-  String name = trackCount > 0 ? trackList[currentTrackIndex] : "No MP3 files found";
-  tft.setTextColor(COL_ACID, COL_PANEL);
-  tft.setCursor(14, 24);
-  tft.print(truncateToWidth(name, 132) + "               ");
-  tft.setCursor(14, 38);
-  tft.printf("Track %d / %d      ", trackCount > 0 ? currentTrackIndex + 1 : 0, trackCount);
+
+  // Track number only changes when a new track starts, not every tick. The
+  // track name itself is drawn by the marquee updater in loop().
+  if (currentTrackIndex != lastDrawnSDTrackIndex) {
+    char trkBuf[16];
+    snprintf(trkBuf, sizeof(trkBuf), "Track %d/%d", trackCount > 0 ? currentTrackIndex + 1 : 0, trackCount);
+    drawClearedText(INFO_X + 4, INFO_Y + 8, INFO_W - 8, trkBuf, COL_ACID, COL_PANEL);
+    lastDrawnSDTrackIndex = currentTrackIndex;
+  }
 
   AUDIO_LOCK();
   bool running = audio.isRunning();
@@ -478,18 +847,24 @@ void drawSDPlayerDynamic() {
   int dur = running ? audio.getAudioFileDuration() : 0;
   AUDIO_UNLOCK();
 
-  char timeBuf[24];
-  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d / %02d:%02d   ", cur / 60, cur % 60, dur / 60, dur % 60);
-  tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.setCursor(14, 70);
-  tft.print(timeBuf);
+  // Time genuinely changes every second, so it always redraws.
+  char timeBuf[16];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", cur / 60, cur % 60, dur / 60, dur % 60);
+  drawClearedText(INFO_X + 4, INFO_Y + 26, INFO_W - 8, timeBuf, COL_DIM, COL_PANEL);
 
+  // Volume can change any time the pot is turned, so it stays live too.
   int volPct = readSmoothedVolume();
-  tft.setTextColor(isPlaying ? COL_ACID : COL_MAGENTA, COL_PANEL);
-  tft.setCursor(14, 86);
-  tft.printf("%s  Vol:%2d   ", isPlaying ? "> PLAY" : "|| PAUSE", volPct);
+  char volBuf[16];
+  snprintf(volBuf, sizeof(volBuf), "Vol:%2d", volPct);
+  drawClearedText(INFO_X + 4, INFO_Y + 44, INFO_W - 8, volBuf, isPlaying ? COL_ACID : COL_MAGENTA, COL_PANEL);
 
-  drawSDProgressBar(cur, dur);
+  drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, cur, dur);
+
+  // Transport icons only redrawn when play/pause state actually flips.
+  if (!sdTransportDrawn || isPlaying != lastDrawnSDPlaying) {
+    lastDrawnSDPlaying = isPlaying;
+    sdTransportDrawn = true;
+  }
 }
 
 // ==========================================
@@ -513,13 +888,11 @@ void handleEncoderSwitch() {
   if (encSwLastState == LOW && state == HIGH) {
     unsigned long heldFor = millis() - encSwPressStart;
     if (!encSwLongTriggered && heldFor < LONG_PRESS_MS) {
-      // short click = select
       if (appState == STATE_MENU) {
         if (menuIndex == 0) enterSpotify();
         else enterSDPlayer();
       } else if (appState == STATE_SD_BROWSE && trackCount > 0) {
         currentTrackIndex = browseIndex % trackCount;
-        playTrack(currentTrackIndex);
         appState = STATE_SD_PLAYING;
         screenNeedsFullDraw = true;
       }
@@ -529,16 +902,14 @@ void handleEncoderSwitch() {
   encSwLastState = state;
 }
 
-// Sets listNeedsRedraw (NOT screenNeedsFullDraw) -- moving the selection
-// should only repaint the buttons/list, never the background.
 void handleSelectionEncoder(int maxCount, int &idx) {
-  if (maxCount <= 0) return; // guard against div/mod by zero
+  if (maxCount <= 0) return;
   int delta = encoderValue - lastMenuEncoderValue;
   if (abs(delta) >= ENCODER_STEPS_PER_CLICK) {
     if (delta > 0) idx = (idx + 1) % maxCount;
     else idx = (idx - 1 + maxCount) % maxCount;
     lastMenuEncoderValue = encoderValue;
-    listNeedsRedraw = true; // redraw list on move
+    listNeedsRedraw = true;
   }
 }
 
@@ -547,7 +918,6 @@ void handleSW1SW2() {
   bool sw2State = digitalRead(SW2_PIN);
 
   if (millis() - lastButtonAction > BUTTON_DEBOUNCE) {
-    // SW1 = Next
     if (sw1LastState == HIGH && sw1State == LOW) {
       if (appState == STATE_SPOTIFY) {
         if (wifiMulti.run() == WL_CONNECTED) spotify.nextTrack();
@@ -556,7 +926,6 @@ void handleSW1SW2() {
       }
       lastButtonAction = millis();
     }
-    // SW2 = Play/Pause
     if (sw2LastState == HIGH && sw2State == LOW) {
       if (appState == STATE_SPOTIFY) {
         if (wifiMulti.run() == WL_CONNECTED) {
@@ -639,10 +1008,40 @@ void loop() {
   handleEncoderSwitch();
   handleSW1SW2();
 
-  // --- Spotify polling ---
+  // Lightweight heap watch. If minFreeHeap trends downward over a long
+  // session, that indicates fragmentation/leak worth investigating further;
+  // if it stays flat, string-allocation churn is not the culprit.
+  if (millis() - lastHeapLog > 15000) {
+    Serial.printf("Free heap: %u  Min free heap ever: %u\n", ESP.getFreeHeap(), ESP.getMinFreeHeap());
+    lastHeapLog = millis();
+  }
+
   if (appState == STATE_SPOTIFY && millis() - lastSpotifyCheck > 5000) {
     if (wifiMulti.run() == WL_CONNECTED) {
       spotify.getCurrentlyPlaying(spotifyCallback);
+
+      if (currentSpotifyUrl != lastSpotifyUrl && currentSpotifyUrl != "") {
+        lastSpotifyUrl = currentSpotifyUrl;
+
+        if (downloadSpotifyCover(currentSpotifyUrl)) {
+          AUDIO_LOCK();
+          File check = SD.open("/spoty.jpg");
+          bool progressive = check && jpegIsProgressive(check);
+          if (check) check.close();
+          AUDIO_UNLOCK();
+
+          if (progressive) {
+            Serial.println("Spotify cover is progressive JPEG -- skipping draw.");
+            clearCoverBox();
+          } else {
+            clearCoverBox();
+            AUDIO_LOCK();
+            TJpgDec.setJpgScale(1);
+            TJpgDec.drawFsJpg(SPOTIFY_IMG_X, SPOTIFY_IMG_Y, "/spoty.jpg", SD);
+            AUDIO_UNLOCK();
+          }
+        }
+      }
     } else {
       currentTrack = "Wi-Fi Lost!";
       currentArtist = "Searching...";
@@ -650,7 +1049,6 @@ void loop() {
     lastSpotifyCheck = millis();
   }
 
-  // --- Live volume control while in SD player mode ---
   if (appState == STATE_SD_PLAYING) {
     int vol = readSmoothedVolume();
     AUDIO_LOCK();
@@ -658,7 +1056,27 @@ void loop() {
     AUDIO_UNLOCK();
   }
 
-  // --- Per-state input + redraw ---
+  // Marquee scrolling runs on its own fast cadence, independent of the
+  // once-a-second field refresh below -- a smooth left-scroll needs to
+  // move a pixel or two far more often than 1x/sec to not look choppy.
+  if (millis() - lastMarqueeTime > MARQUEE_STEP_MS) {
+    lastMarqueeTime = millis();
+    if (appState == STATE_SPOTIFY) {
+      marqueeSetText(artistMarquee, currentArtist, INFO_W - 8, COL_ACID, COL_PANEL);
+      marqueeDraw(artistMarquee, INFO_X + 4, INFO_Y + 8, COL_PANEL);
+
+      marqueeSetText(trackMarquee, currentTrack, NAME_W - 4, COL_ACID, COL_BG_BOT);
+      marqueeDraw(trackMarquee, NAME_X, NAME_Y, COL_BG_BOT);
+    } else if (appState == STATE_SD_PLAYING && sdMounted) {
+      String name = trackCount > 0 ? trackList[currentTrackIndex] : "No files";
+      if (name.endsWith(".mp3") || name.endsWith(".MP3")) {
+        name = name.substring(0, name.length() - 4);
+      }
+      marqueeSetText(trackMarquee, name, NAME_W - 4, COL_ACID, COL_BG_BOT);
+      marqueeDraw(trackMarquee, NAME_X, NAME_Y, COL_BG_BOT);
+    }
+  }
+
   if (appState == STATE_MENU) {
     if (screenNeedsFullDraw) {
       drawMenuStatic();
@@ -693,11 +1111,16 @@ void loop() {
     if (screenNeedsFullDraw) {
       drawSDPlayerStatic();
       screenNeedsFullDraw = false;
+      playTrack(currentTrackIndex);
     }
   }
 
-  // --- Dynamic field refresh (every 200ms) ---
-  if (millis() - lastUITime > 200) {
+  // Was 200ms (5Hz) -- nothing shown on these screens changes faster than
+  // once a second, so redrawing 5x more often than needed was the main
+  // source of the "constantly refreshing" feeling. Combined with the
+  // change-detection above, this now redraws once a second and skips
+  // fields that haven't actually changed.
+  if (millis() - lastUITime > 1000) {
     if (appState == STATE_SPOTIFY) drawSpotifyDynamic();
     else if (appState == STATE_SD_PLAYING) drawSDPlayerDynamic();
     lastUITime = millis();
