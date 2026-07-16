@@ -123,6 +123,8 @@ void clearCoverCache();
 bool jpegIsProgressive(File &f);
 void drawCurrentSDCover();
 void enterMenu();
+void applyFallbackCover();
+bool coverLooksBlack();
 
 enum AppState { STATE_MENU, STATE_SPOTIFY, STATE_SD_BROWSE, STATE_SD_PLAYING, STATE_SYNC };
 AppState appState = STATE_MENU;
@@ -175,6 +177,15 @@ uint16_t coverCache[CACHE_W * CACHE_H];
 bool coverCacheValid = false;
 bool coverThemeDirty = false;
 
+// Tracks whether we're still waiting to find out if the CURRENT track even
+// has embedded cover art. audio_id3image() only fires if an ID3 image tag
+// exists -- for a track with none at all, nothing would ever call it, so
+// this timeout is what decides "definitely not coming" and triggers the
+// backup cover instead of leaving the panel blank forever.
+bool coverPending = false;
+unsigned long coverPendingSince = 0;
+const unsigned long COVER_FETCH_TIMEOUT_MS = 2500;
+
 uint16_t themeGradient[160]; 
 
 // ==========================================
@@ -213,9 +224,6 @@ void initCyberPalette() {
   COL_DIM         = tft.color565(150, 130, 170);
   COL_DIMMER      = tft.color565(70, 55, 85);
   COL_SCANLINE    = tft.color565(0, 0, 0);
-
-  // Pre-fill the gradient so menus look good before the first song loads.
-  // This is also what stays in effect permanently when USE_COVER_THEME is 0.
   for (int y = 0; y < 160; y++) {
     float t = (float)y / 127.0;
     themeGradient[y] = lerpColor(COL_BG_TOP, COL_BG_BOT, t);
@@ -257,9 +265,7 @@ void updateThemeFromCover() {
  
   COL_ACID = sampleColors[0];
 #endif
-  // When USE_COVER_THEME is 0, this function is a no-op: themeGradient stays
-  // whatever initCyberPalette() set it to, and COL_ACID stays at its fixed
-  // default -- i.e. the plain, non-cover-driven look.
+
 }
 
 void drawCyberBackground() {
@@ -505,24 +511,22 @@ void drawCurrentSDCover() {
   }
 }
 
-// Fills the whole cover cache buffer with the panel background color.
-// MUST be called right before decoding any new cover art into it.
-//
-// Why: coverCache is a persistent buffer that's never cleared between
-// tracks. TJpgDec only writes the pixels of the actual decoded image --
-// and different tracks' embedded art gets decoded at different JPEG
-// scales (depending on its original resolution), so a new cover is often
-// SMALLER on screen than the previous one. Without clearing first, the
-// new (smaller) image only overwrites the center of the buffer, leaving
-// the previous cover's edge pixels sitting in the outer ring -- which is
-// exactly the "background remains, only the center changes" bug after
-// skipping tracks. It only looked "reset" once a track with no embedded
-// art came along and coverCacheValid went false, causing a plain panel
-// fill instead of a stale blit.
+
 void clearCoverCache() {
   for (int i = 0; i < CACHE_W * CACHE_H; i++) {
     coverCache[i] = COL_PANEL;
   }
+}
+
+bool coverLooksBlack() {
+  const int totalPixels = CACHE_W * CACHE_H;
+  int blackCount = 0;
+  int sampled = 0;
+  for (int i = 0; i < totalPixels; i += 4) {
+    if (coverCache[i] == 0x0000) blackCount++;
+    sampled++;
+  }
+  return sampled > 0 && (blackCount * 100 / sampled) > 90;
 }
 
 void audio_id3image(File& file, const size_t pos, const size_t size) {
@@ -546,6 +550,7 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
   AUDIO_UNLOCK();
 
   AUDIO_LOCK();
+  bool decodedOk = false;
   if (SD.exists("/cover.jpg")) {
     File check = SD.open("/cover.jpg");
     bool progressive = check && jpegIsProgressive(check);
@@ -568,14 +573,24 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
       int dX = COVER_CLIP_MINX + (maxDim - scaledW) / 2;
       int dY = COVER_CLIP_MINY + (maxDim - scaledH) / 2;
 
-      clearCoverCache(); // wipe stale pixels from the previous track's cover first
+      clearCoverCache(); 
       TJpgDec.drawFsJpg(dX, dY, "/cover.jpg", SD);
-      coverCacheValid = true;
-      coverThemeDirty = true;      // was: updateThemeFromCover() called here directly
-      screenNeedsFullDraw = true;
+
+      if (!coverLooksBlack()) {
+        decodedOk = true;
+        coverCacheValid = true;
+        coverThemeDirty = true;      
+        screenNeedsFullDraw = true;
+      }
+
     }
+
   }
   AUDIO_UNLOCK();
+  if (!decodedOk) {
+    applyFallbackCover();
+  }
+  coverPending = false;
 }
 
 void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
@@ -691,7 +706,9 @@ void playTrack(int idx) {
   if (!path.startsWith("/")) path = "/" + path;
 
   coverCacheValid = false;
-  clearCoverCache(); // start the next track with a clean cache, not last track's leftovers
+  clearCoverCache(); 
+  coverPending = true;
+  coverPendingSince = millis();
   AUDIO_LOCK();
   if (SD.exists("/cover.jpg")) {
     SD.remove("/cover.jpg"); 
@@ -823,7 +840,7 @@ void performWiFiSync() {
         }
         http.end();
         yPos += 12; 
-        if (yPos > 110) yPos = 30; // Wrap text if too many files
+        if (yPos > 110) yPos = 30; 
       }
     }
     if (end == -1) break;
@@ -868,17 +885,16 @@ void enterSDPlayer() {
 
 void drawMenuStatic() {
   drawCyberBackground();
-  tft.setTextSize(2);
-  tft.setTextColor(COL_MAGENTA);
-  tft.setCursor(22, 6);
-  tft.print("PRO-DASH");
   tft.setTextSize(1);
-  tft.setTextColor(COL_DIM);
-  tft.setCursor(10, 112);
+  tft.setTextColor(COL_DIMMER);
+  tft.setCursor(4, 119);
+  tft.print("made by cwik3");
 }
 
 void drawMenuButtons() {
-  const int btnW = 130, btnH = 28, gap = 8, startY = 38;
+  const int btnW = 130, btnH = 28, gap = 8;
+  const int totalH = MENU_COUNT * btnH + (MENU_COUNT - 1) * gap;
+  const int startY = (128 - totalH) / 2;
   for (int i = 0; i < MENU_COUNT; i++) {
     drawGlassButton(15, startY + i * (btnH + gap), btnW, btnH, menuItems[i], i == menuIndex);
   }
@@ -953,10 +969,6 @@ void drawSDPlayerStatic() {
     tft.setTextColor(COL_MAGENTA);
     tft.setCursor(4, 4);
     tft.print("DJ MIXER");
-
-    tft.setTextColor(COL_DIM);
-    tft.setCursor(120, 4);
-    tft.print("[BACK]");
 
     const char* labels[] = {"VOL", "BAS", "MID", "HIG", "PAN"};
     for (int i = 0; i < 5; i++) {
@@ -1168,6 +1180,38 @@ void handleSW1SW2() {
   sw2LastState = sw2State;
 }
 
+void applyFallbackCover() {
+  // Pick a random backup cover from 1 to 4
+  int randCover = random(1, 5); 
+  String fallbackPath = "/backup" + String(randCover) + ".jpg";
+
+  AUDIO_LOCK();
+  if (SD.exists(fallbackPath)) {
+    uint16_t imgW = 0, imgH = 0;
+    TJpgDec.getFsJpgSize(&imgW, &imgH, fallbackPath.c_str(), SD);
+
+    const int maxDim = COVER_W - 2;
+    int scale = 1;
+    while ((imgW / scale > maxDim) || (imgH / scale > maxDim)) {
+      scale *= 2;
+      if (scale >= 8) break; 
+    }
+    TJpgDec.setJpgScale(scale);
+
+    int scaledW = imgW / scale;
+    int scaledH = imgH / scale;
+    int dX = COVER_CLIP_MINX + (maxDim - scaledW) / 2;
+    int dY = COVER_CLIP_MINY + (maxDim - scaledH) / 2;
+
+    clearCoverCache();
+    TJpgDec.drawFsJpg(dX, dY, fallbackPath.c_str(), SD);
+    coverCacheValid = true;
+    coverThemeDirty = true;
+    screenNeedsFullDraw = true;
+  }
+  AUDIO_UNLOCK();
+}
+
 // ==========================================
 // 9. SETUP
 // ==========================================
@@ -1178,6 +1222,7 @@ void setup() {
   while (!Serial) { delay(10); }
 
   audioMutex = xSemaphoreCreateRecursiveMutex();
+  randomSeed(esp_random()); 
 
   Serial.println("\n--- Initializing Wi-Fi ---");
   WiFi.mode(WIFI_STA); 
@@ -1235,8 +1280,6 @@ void loop() {
   if (millis() - lastHeapLog > 15000) {
     lastHeapLog = millis();
   }
-
-  // --- SPOTIFY THEME AND COVER DOWNLOAD LOGIC ---
   if (appState == STATE_SPOTIFY && millis() - lastSpotifyCheck > 5000) {
     if (wifiMulti.run() == WL_CONNECTED) {
       spotify.getCurrentlyPlaying(spotifyCallback);
@@ -1255,17 +1298,24 @@ void loop() {
             coverCacheValid = false;
             clearCoverCache();
             clearCoverBox();
+            applyFallbackCover();
           } else {
-            clearCoverCache(); // wipe stale pixels from the previous cover first
+            clearCoverCache(); 
             AUDIO_LOCK();
             TJpgDec.setJpgScale(1);
             TJpgDec.drawFsJpg(SPOTIFY_IMG_X, SPOTIFY_IMG_Y, "/spoty.jpg", SD);
             AUDIO_UNLOCK();
- 
-            coverCacheValid = true;
-            coverThemeDirty = true;
-            screenNeedsFullDraw = true;
+
+            if (coverLooksBlack()) {
+              applyFallbackCover();
+            } else {
+              coverCacheValid = true;
+              coverThemeDirty = true;
+              screenNeedsFullDraw = true;
+            }
           }
+        } else {
+          applyFallbackCover();
         }
       }
     } else {
@@ -1279,9 +1329,14 @@ void loop() {
     int vol = readSmoothedVolume();
     AUDIO_LOCK();
     audio.setVolume(vol);
-    AUDIO_UNLOCK();
-    
+    AUDIO_UNLOCK(); 
     updateDSP(); 
+    if (coverPending && millis() - coverPendingSince > COVER_FETCH_TIMEOUT_MS) {
+      coverPending = false;
+      if (!coverCacheValid) {
+        applyFallbackCover();
+      }
+    }
   }
 
   if (millis() - lastMarqueeTime > MARQUEE_STEP_MS) {
@@ -1308,7 +1363,6 @@ void loop() {
     }
   }
 
-  // --- STATE DISPATCH (one branch runs per loop, based on appState) ---
   if (appState == STATE_MENU) {
     if (screenNeedsFullDraw) {
       drawMenuStatic();
@@ -1348,14 +1402,10 @@ void loop() {
   else if (appState == STATE_SYNC) {
     if (screenNeedsFullDraw) {
       screenNeedsFullDraw = false;
-      performWiFiSync(); // <--- Run the download engine!
+      performWiFiSync();
     }
   }
 
-  // --- SD PLAYER REDRAW TIMER (separate concern from state dispatch above:
-  // DJ-mixer sliders need a much faster refresh than the plain now-playing
-  // view, so this runs its own cadence check rather than living inside the
-  // if/else-if chain above). ---
   if (appState == STATE_SD_PLAYING) {
     if (isDjMixerActive && millis() - lastUITime > 30) {
       drawSDPlayerDynamic();
