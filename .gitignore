@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+# Ignore downloaded MP3s and SpotDL caches
+music_hub/music/
+music_hub/*.spotdl
+music_hub/__pycache__/
