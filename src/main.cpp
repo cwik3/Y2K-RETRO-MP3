@@ -12,8 +12,24 @@
 #include "secrets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include <HTTPClient.h> 
-#define SERVER_IP "192.168.1.17"
+#include <HTTPClient.h>
+#include <driver/i2s.h>
+#include <math.h>
+#define SERVER_IP "192.168.1.182"
+
+// Flip any of these to 0 if it doesn't compile 
+#define ENABLE_FFT_SPECTRUM     0   // real-time spectrum bars only for SD 
+#define ENABLE_BATTERY_MON      0   // battery % icon on the menu screen
+#define ENABLE_SPOTIFY_LIKE     0   // long-press SW1 in Spotify view = Like
+#define ENABLE_GAPLESS_PREFETCH 1   // SD-cache warm-up before track end
+
+#if ENABLE_FFT_SPECTRUM
+#include <arduinoFFT.h>
+#endif
+
+#if ENABLE_SPOTIFY_LIKE
+#include "mbedtls/base64.h"
+#endif
 
 WiFiMulti wifiMulti;
 WiFiClientSecure client;
@@ -22,11 +38,6 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 // ==========================================
 // 0. THEME CONFIG
 // ==========================================
-// Set this to 0 to turn OFF the cover-art-driven gradient/accent-color
-// theme entirely and fall back to the plain default background gradient
-// and fixed COL_ACID accent -- i.e. the "casual" look. Set back to 1 to
-// re-enable sampling colors from the album art. This is the only thing
-// you need to flip.
 #define USE_COVER_THEME 0
 
 // ==========================================
@@ -50,15 +61,22 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define ENC_CLK 40
 #define ENC_DT  41
 #define ENC_SW  39
-#define SW1_PIN 48
-#define SW2_PIN 13
+#define SW1_PIN 47
+#define SW2_PIN 48
 
 // ALL SAFE ADC1 PINS
 #define POT1_PIN 1  // Master Volume
 #define POT2_PIN 2  // Low/Bass EQ
 #define POT3_PIN 7  // Mid EQ
 #define POT4_PIN 8  // High/Treble EQ
-#define POT5_PIN 9  // Stereo Balance/Pan 
+// Dual-purpose: Pan/Balance by default, Speed/Pitch when toggled. Long-
+// press SW2 while a track is playing to switch modes (see handleSW1SW2()).
+#define POT5_PIN 9
+
+#if ENABLE_BATTERY_MON
+//need analog fre pin
+#define BATT_PIN 3
+#endif
 
 // ==========================================
 // 2b. DASHBOARD LAYOUT CONSTANTS
@@ -98,10 +116,20 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 SPIClass spiSD(HSPI);
 Audio audio;
-
 SemaphoreHandle_t audioMutex;
 #define AUDIO_LOCK()   xSemaphoreTakeRecursive(audioMutex, portMAX_DELAY)
 #define AUDIO_UNLOCK() xSemaphoreGiveRecursive(audioMutex)
+SemaphoreHandle_t displayMutex;
+#define DISPLAY_LOCK()   xSemaphoreTakeRecursive(displayMutex, portMAX_DELAY)
+#define DISPLAY_UNLOCK() xSemaphoreGiveRecursive(displayMutex)
+
+SemaphoreHandle_t uiStateMutex;
+#define UI_LOCK()   xSemaphoreTake(uiStateMutex, portMAX_DELAY)
+#define UI_UNLOCK() xSemaphoreGive(uiStateMutex)
+
+#if ENABLE_FFT_SPECTRUM
+SemaphoreHandle_t spectrumMutex;
+#endif
 
 volatile int encoderValue = 0;
 unsigned long lastUITime = 0;
@@ -125,6 +153,7 @@ void drawCurrentSDCover();
 void enterMenu();
 void applyFallbackCover();
 bool coverLooksBlack();
+void networkTask(void *parameter);
 
 enum AppState { STATE_MENU, STATE_SPOTIFY, STATE_SD_BROWSE, STATE_SD_PLAYING, STATE_SYNC };
 AppState appState = STATE_MENU;
@@ -148,10 +177,19 @@ const unsigned long LONG_PRESS_MS = 700;
 
 bool sw1LastState = HIGH;
 bool sw2LastState = HIGH;
+bool sw2LongTriggered = false;
+unsigned long sw2PressStart = 0;
 unsigned long lastButtonAction = 0;
 const unsigned long BUTTON_DEBOUNCE = 250;
 String currentSpotifyUrl = "";
 String lastSpotifyUrl = "none";
+
+#if ENABLE_SPOTIFY_LIKE
+String currentSpotifyTrackId = "";
+bool sw1LongTriggered = false;
+unsigned long sw1PressStart = 0;
+unsigned long likedFlashUntil = 0;
+#endif
 
 String trackList[40];
 int trackCount = 0;
@@ -177,11 +215,6 @@ uint16_t coverCache[CACHE_W * CACHE_H];
 bool coverCacheValid = false;
 bool coverThemeDirty = false;
 
-// Tracks whether we're still waiting to find out if the CURRENT track even
-// has embedded cover art. audio_id3image() only fires if an ID3 image tag
-// exists -- for a track with none at all, nothing would ever call it, so
-// this timeout is what decides "definitely not coming" and triggers the
-// backup cover instead of leaving the panel blank forever.
 bool coverPending = false;
 unsigned long coverPendingSince = 0;
 const unsigned long COVER_FETCH_TIMEOUT_MS = 2500;
@@ -194,10 +227,64 @@ uint16_t themeGradient[160];
 int smoothBass = 2048;
 int smoothMid  = 2048;
 int smoothHigh = 2048;
-int smoothBal  = 2048;
+
+// POT5 is dual-purpose now: Pan/Balance by default, Speed when toggled
+int smoothPot5 = 1024;
+const int POT5_CENTER = 1024;
+const int POT5_DEADZONE = 150; // +/- around center treated as "neutral"
+
+bool pot5IsSpeedMode = false;   // false = Pan (default), true = Speed
+bool pot5NeedsReapply = false;  // force a re-apply next updateDSP() pass
+                                 // (set on track change AND on mode toggle)
+
+float currentSpeedMod = 1.0f;   // for the on-screen "1.00x" readout
+int8_t currentPanValue = 0;     // for the on-screen pan readout
 
 unsigned long lastDspTime = 0;
-int8_t lastBassGain = 100, lastMidGain = 100, lastHighGain = 100, lastBalance = 100;
+int8_t lastBassGain = 100, lastMidGain = 100, lastHighGain = 100;
+int8_t lastAppliedBalGain = 100;   // sentinel (mapBalance never returns 100)
+float lastAppliedSpeedModDsp = 1.0f;
+
+// ==========================================
+// 3c. BATTERY MONITORING STATE
+// ==========================================
+#if ENABLE_BATTERY_MON
+float battSmoothedRaw = -1.0f;
+int battPercent = 100;
+unsigned long lastBattRead = 0;
+const unsigned long BATT_READ_INTERVAL_MS = 2000;
+const float BATT_DIVIDER_RATIO = 2.0f;
+const float BATT_EMPTY_V = 3.3f;
+const float BATT_FULL_V  = 4.2f;
+#endif
+
+// ==========================================
+// 3d. SPECTRUM ANALYZER STATE
+// ==========================================
+#if ENABLE_FFT_SPECTRUM
+#define FFT_SAMPLES 256
+#define NUM_BARS 16
+#define RAW_SAMPLE_SHIFT 16
+#define FFT_NORM_DIVISOR 4000.0f
+float fftReal[FFT_SAMPLES];
+float fftImag[FFT_SAMPLES];
+ArduinoFFT<float> FFT(fftReal, fftImag, FFT_SAMPLES, 44100.0f);
+
+int16_t pcmRing[FFT_SAMPLES];
+volatile int pcmRingWritePos = 0;
+volatile bool pcmRingFull = false;
+
+float barMagnitude[NUM_BARS] = {0};
+float barPeak[NUM_BARS] = {0};
+#endif
+
+// ==========================================
+// 3e. GAPLESS PREFETCH STATE
+// ==========================================
+#if ENABLE_GAPLESS_PREFETCH
+File nextTrackPreopened;
+int nextTrackPreopenedIdx = -1;
+#endif
 
 // ==========================================
 // 4. Y2K / CYBERSIGIL DRAW HELPERS
@@ -265,7 +352,6 @@ void updateThemeFromCover() {
  
   COL_ACID = sampleColors[0];
 #endif
-
 }
 
 void drawCyberBackground() {
@@ -355,6 +441,73 @@ void drawProgressBar(int x, int y, int w, int h, int curSec, int durSec) {
   }
 }
 
+void drawSpeedIndicator(int x, int y, int w, float speedMod) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%.2fx", speedMod);
+  uint16_t bg = themeGradient[constrain(y, 0, 127)];
+  DISPLAY_LOCK();
+  tft.fillRect(x, y, w, TEXT_ROW_H, bg);
+  tft.setTextColor(COL_ACID, bg);
+  tft.setCursor(x, y);
+  tft.print(buf);
+  DISPLAY_UNLOCK();
+}
+
+// Pan readout: "C" when centered, "L 8"/"R 8" otherwise. Shares the same
+// slot on screen as drawSpeedIndicator() -- only one of the two is ever
+// called at a time, depending on pot5IsSpeedMode.
+void drawPanIndicator(int x, int y, int w, int8_t panValue) {
+  char buf[8];
+  if (panValue == 0) {
+    snprintf(buf, sizeof(buf), "PAN:C");
+  } else if (panValue < 0) {
+    snprintf(buf, sizeof(buf), "L%d", -panValue);
+  } else {
+    snprintf(buf, sizeof(buf), "R%d", panValue);
+  }
+  uint16_t bg = themeGradient[constrain(y, 0, 127)];
+  DISPLAY_LOCK();
+  tft.fillRect(x, y, w, TEXT_ROW_H, bg);
+  tft.setTextColor(COL_ACID, bg);
+  tft.setCursor(x, y);
+  tft.print(buf);
+  DISPLAY_UNLOCK();
+}
+
+#if ENABLE_BATTERY_MON
+void drawBatteryIcon(int x, int y) {
+  uint16_t col = battPercent > 50 ? COL_ACID
+               : (battPercent > 20 ? tft.color565(255, 200, 0) : COL_MAGENTA);
+  DISPLAY_LOCK();
+  tft.drawRect(x, y, 18, 9, COL_DIMMER);          // body outline
+  tft.fillRect(x + 18, y + 2, 2, 5, COL_DIMMER);  // nub
+  tft.fillRect(x + 2, y + 2, 14, 5, COL_PANEL);   // clear interior
+  int fillW = map(battPercent, 0, 100, 0, 14);
+  if (fillW > 0) tft.fillRect(x + 2, y + 2, fillW, 5, col);
+  DISPLAY_UNLOCK();
+}
+#endif
+
+#if ENABLE_FFT_SPECTRUM
+// Drawn in the free strip below the progress bar on the normal (non-DJ-
+// mixer) SD player view.
+void drawSpectrumBars(int x, int y, int w, int h) {
+  const int gap = 1;
+  int barW = (w - (NUM_BARS - 1) * gap) / NUM_BARS;
+  DISPLAY_LOCK();
+  for (int i = 0; i < NUM_BARS; i++) {
+    int bx = x + i * (barW + gap);
+    int barH = (int)(barMagnitude[i] * h);
+    tft.fillRect(bx, y, barW, h - barH, COL_PANEL);         // empty headroom
+    tft.fillRect(bx, y + h - barH, barW, barH, COL_ACID);   // filled portion
+
+    int peakY = y + h - (int)(barPeak[i] * h);
+    tft.drawFastHLine(bx, constrain(peakY, y, y + h - 1), barW, COL_MAGENTA);
+  }
+  DISPLAY_UNLOCK();
+}
+#endif
+
 // ==========================================
 // 4b. MARQUEE (SCROLLING TEXT) HELPERS
 // ==========================================
@@ -379,6 +532,8 @@ GFXcanvas16 trackCanvasBuf(260, TEXT_ROW_H);
 Marquee artistMarquee(&artistCanvasBuf);
 Marquee trackMarquee(&trackCanvasBuf);
 
+// Only ever called from the UI task, and only touches the off-screen
+// GFXcanvas16 (not the physical tft), so it doesn't need displayMutex.
 void marqueeSetText(Marquee &m, const String &text, int boxW, uint16_t fg, uint16_t bg) {
   m.boxW = boxW;
   if (text == m.text) return;
@@ -409,6 +564,7 @@ void marqueeSetText(Marquee &m, const String &text, int boxW, uint16_t fg, uint1
   }
 }
 
+// This one DOES touch the physical tft (drawRGBBitmap), so it locks.
 void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
   static uint16_t sliceBuf[300];
   int boxW = m.boxW;
@@ -431,6 +587,7 @@ void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
   int canvasW = m.canvas->width();
   int srcStart = m.scrolling ? m.scrollX : 0;
 
+  DISPLAY_LOCK();
   for (int row = 0; row < TEXT_ROW_H; row++) {
     for (int col = 0; col < boxW; col++) {
       int srcCol = srcStart + col;
@@ -438,6 +595,7 @@ void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
     }
     tft.drawRGBBitmap(x, y + row, sliceBuf, boxW, 1);
   }
+  DISPLAY_UNLOCK();
 }
 
 // ==========================================
@@ -467,6 +625,8 @@ void IRAM_ATTR encoderISR() {
   }
 }
 
+// Highest-priority task: nothing but feeding the decoder/I2S-DMA ring, and
+// yields every 1ms so it can never starve the other two tasks.
 void audioTask(void *parameter) {
   while (true) {
     AUDIO_LOCK();
@@ -505,12 +665,13 @@ bool jpegIsProgressive(File &f) {
   return false;
 }
 
+// UI-task-only: this is the sole place the RAM cover cache is ever blitted
+// to the physical screen.
 void drawCurrentSDCover() {
   if (coverCacheValid) {
     tft.drawRGBBitmap(COVER_CLIP_MINX, COVER_CLIP_MINY, coverCache, CACHE_W, CACHE_H);
   }
 }
-
 
 void clearCoverCache() {
   for (int i = 0; i < CACHE_W * CACHE_H; i++) {
@@ -582,9 +743,7 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
         coverThemeDirty = true;      
         screenNeedsFullDraw = true;
       }
-
     }
-
   }
   AUDIO_UNLOCK();
   if (!decodedOk) {
@@ -593,7 +752,67 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
   coverPending = false;
 }
 
+#if ENABLE_FFT_SPECTRUM
+// ==========================================
+// 5b. SPECTRUM ANALYZER
+// ==========================================
+void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples) {
+  if (xSemaphoreTake(spectrumMutex, 0) != pdTRUE) return;
+  // Assumed interleaved stereo (L,R,L,R,...), taking the left channel only
+  // -- see the comment block near the top of the file if this needs
+  // adjusting for your library version.
+  for (int16_t i = 0; i + 1 < validSamples; i += 2) {
+    int32_t sample = outBuff[i];
+    int16_t s16 = (int16_t)(sample >> RAW_SAMPLE_SHIFT);
+    pcmRing[pcmRingWritePos] = s16;
+    pcmRingWritePos++;
+    if (pcmRingWritePos >= FFT_SAMPLES) {
+      pcmRingWritePos = 0;
+      pcmRingFull = true;
+    }
+  }
+  xSemaphoreGive(spectrumMutex);
+}
+
+void computeSpectrum() {
+  if (!pcmRingFull) return;
+  if (xSemaphoreTake(spectrumMutex, 0) != pdTRUE) return;
+
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    fftReal[i] = (float)pcmRing[i];
+    fftImag[i] = 0.0f;
+  }
+  xSemaphoreGive(spectrumMutex);
+
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  const int usableBins = FFT_SAMPLES / 2;
+  for (int bar = 0; bar < NUM_BARS; bar++) {
+    int startBin = (int)(pow((float)bar / NUM_BARS, 2.0f) * usableBins) + 1;
+    int endBin   = (int)(pow((float)(bar + 1) / NUM_BARS, 2.0f) * usableBins) + 1;
+    if (endBin <= startBin) endBin = startBin + 1;
+    if (endBin > usableBins) endBin = usableBins;
+
+    float sum = 0;
+    int count = 0;
+    for (int b = startBin; b < endBin; b++) {
+      sum += fftReal[b];
+      count++;
+    }
+    float avg = count > 0 ? (sum / count) : 0.0f;
+    float norm = constrain(avg / FFT_NORM_DIVISOR, 0.0f, 1.0f);
+    barMagnitude[bar] = (norm > barMagnitude[bar]) ? norm : barMagnitude[bar] * 0.75f;
+    barPeak[bar] = max(barPeak[bar] * 0.95f, barMagnitude[bar]);
+  }
+}
+#endif
+
+// Runs on networkTask. Writes only the shared Spotify text fields --
+// guarded by uiStateMutex since the UI task's marquee reads them.
 void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
+  UI_LOCK();
   if (currentlyPlaying.isPlaying) {
     currentTrack = String(currentlyPlaying.trackName);
 
@@ -613,6 +832,10 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
     } else {
       currentSpotifyUrl = "";
     }
+
+#if ENABLE_SPOTIFY_LIKE
+    currentSpotifyTrackId = String(currentlyPlaying.trackId);
+#endif
   } else {
     currentTrack = "Nothing playing";
     currentArtist = "on Spotify";
@@ -621,6 +844,7 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
     spotifyProgressMs = 0;
     spotifyDurationMs = 0;
   }
+  UI_UNLOCK();
 }
 
 bool downloadSpotifyCover(String url) {
@@ -695,7 +919,9 @@ void scanSDTracks() {
 }
 
 void clearCoverBox() {
+  DISPLAY_LOCK();
   tft.fillRect(COVER_X, COVER_Y, COVER_W, COVER_H, COL_PANEL);
+  DISPLAY_UNLOCK();
 }
 
 void playTrack(int idx) {
@@ -715,6 +941,19 @@ void playTrack(int idx) {
   }
   audio.connecttoFS(SD, path.c_str());
   AUDIO_UNLOCK();
+  pot5NeedsReapply = true; 
+
+#if ENABLE_GAPLESS_PREFETCH
+  // If we already warmed this exact track (i.e. it was prefetched as
+  // "next" and we're now actually switching to it), release the handle --
+  // the real playback path opens its own via connecttoFS() above.
+  AUDIO_LOCK();
+  if (nextTrackPreopenedIdx == idx && nextTrackPreopened) {
+    nextTrackPreopened.close();
+  }
+  nextTrackPreopenedIdx = -1;
+  AUDIO_UNLOCK();
+#endif
 
   if (appState == STATE_SD_PLAYING && !isDjMixerActive) {
     clearCoverBox();
@@ -737,11 +976,34 @@ int8_t mapEQ(int rawValue) {
   return 0; 
 }
 
+int8_t mapBalance(int rawValue) {
+  int lo = POT5_CENTER - POT5_DEADZONE;
+  int hi = POT5_CENTER + POT5_DEADZONE;
+  if (rawValue < lo) {
+    return map(rawValue, 0, lo, -16, 0);
+  } else if (rawValue > hi) {
+    return map(rawValue, hi, 4095, 0, 16);
+  }
+  return 0;
+}
+
+// POT5 mapped to playback speed, centered on POT5_CENTER, 50%-150% range.
+float mapSpeed(int rawValue) {
+  int lo = POT5_CENTER - POT5_DEADZONE;
+  int hi = POT5_CENTER + POT5_DEADZONE;
+  if (rawValue < lo) {
+    return map(rawValue, 0, lo, 50, 100) / 100.0f;
+  } else if (rawValue > hi) {
+    return map(rawValue, hi, 4095, 100, 150) / 100.0f;
+  }
+  return 1.0f;
+}
+
 void updateDSP() {
   smoothBass = (smoothBass * 3 + analogRead(POT2_PIN)) / 4;
   smoothMid  = (smoothMid * 3  + analogRead(POT3_PIN)) / 4;
   smoothHigh = (smoothHigh * 3 + analogRead(POT4_PIN)) / 4;
-  smoothBal  = (smoothBal * 3  + analogRead(POT5_PIN)) / 4;
+  smoothPot5 = (smoothPot5 * 3 + analogRead(POT5_PIN)) / 4;
 
   if (millis() - lastDspTime < 30) return;
   lastDspTime = millis();
@@ -750,32 +1012,206 @@ void updateDSP() {
   int8_t midGain  = mapEQ(smoothMid);
   int8_t highGain = mapEQ(smoothHigh);
 
-  int8_t balance = 0;
-  if (smoothBal < 1900) balance = map(smoothBal, 0, 1900, -16, 0);
-  else if (smoothBal > 2200) balance = map(smoothBal, 2200, 4095, 0, 16);
-
   bool toneChanged = (bassGain != lastBassGain || midGain != lastMidGain || highGain != lastHighGain);
-  bool balChanged = (balance != lastBalance);
-
-  if (toneChanged || balChanged) {
+  if (toneChanged) {
     AUDIO_LOCK();
-    if (toneChanged) audio.setTone(bassGain, midGain, highGain);
-    if (balChanged) audio.setBalance(balance);
+    audio.setTone(bassGain, midGain, highGain);
     AUDIO_UNLOCK();
-
     lastBassGain = bassGain;
-    lastMidGain = midGain;
+    lastMidGain  = midGain;
     lastHighGain = highGain;
-    lastBalance = balance;
+  }
+
+  if (pot5IsSpeedMode) {
+    float speedMod = mapSpeed(smoothPot5);
+    bool speedChanged = pot5NeedsReapply || (fabs(speedMod - lastAppliedSpeedModDsp) > 0.02f);
+    if (speedChanged) {
+      AUDIO_LOCK();
+      if (audio.isRunning()) {
+        uint32_t nativeRate = audio.getSampleRate();
+        if (nativeRate > 0) {
+          i2s_set_sample_rates(I2S_NUM_0, (uint32_t)(nativeRate * speedMod));
+        }
+      }
+      AUDIO_UNLOCK();
+      lastAppliedSpeedModDsp = speedMod;
+      currentSpeedMod = speedMod;
+      pot5NeedsReapply = false;
+    }
+  } else {
+    int8_t balGain = mapBalance(smoothPot5);
+    bool balChanged = pot5NeedsReapply || (balGain != lastAppliedBalGain);
+    if (balChanged) {
+      AUDIO_LOCK();
+      audio.setBalance(balGain);
+      AUDIO_UNLOCK();
+      lastAppliedBalGain = balGain;
+      currentPanValue = balGain;
+      pot5NeedsReapply = false;
+    }
   }
 }
 
+void resetInactivePot5Control() {
+  if (pot5IsSpeedMode) {
+    // Entering Speed mode -- reset pan to center.
+    AUDIO_LOCK();
+    audio.setBalance(0);
+    AUDIO_UNLOCK();
+    lastAppliedBalGain = 0;
+    currentPanValue = 0;
+  } else {
+    // Entering Pan mode -- reset speed to native.
+    AUDIO_LOCK();
+    if (audio.isRunning()) {
+      uint32_t nativeRate = audio.getSampleRate();
+      if (nativeRate > 0) i2s_set_sample_rates(I2S_NUM_0, nativeRate);
+    }
+    AUDIO_UNLOCK();
+    lastAppliedSpeedModDsp = 1.0f;
+    currentSpeedMod = 1.0f;
+  }
+}
+
+#if ENABLE_BATTERY_MON
+// ==========================================
+// 6b. BATTERY MONITORING
+// ==========================================
+void updateBattery() {
+  if (millis() - lastBattRead < BATT_READ_INTERVAL_MS) return;
+  lastBattRead = millis();
+
+  int raw = analogRead(BATT_PIN);
+  battSmoothedRaw = (battSmoothedRaw < 0) ? raw : (battSmoothedRaw * 0.9f + raw * 0.1f);
+
+  float vAdc = (battSmoothedRaw / 4095.0f) * 3.3f;
+  float vBatt = vAdc * BATT_DIVIDER_RATIO;
+  float pct = (vBatt - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0f;
+  battPercent = (int)constrain(pct, 0.0f, 100.0f);
+}
+#endif
+
+#if ENABLE_SPOTIFY_LIKE
+String cachedSpotifyAccessToken = "";
+unsigned long spotifyTokenExpiresAt = 0;
+
+String base64Encode(const String &in) {
+  size_t outLen = 0;
+  mbedtls_base64_encode(NULL, 0, &outLen, (const unsigned char*)in.c_str(), in.length());
+  unsigned char *buf = (unsigned char*)malloc(outLen + 1);
+  if (!buf) return "";
+  size_t written = 0;
+  mbedtls_base64_encode(buf, outLen, &written, (const unsigned char*)in.c_str(), in.length());
+  buf[written] = 0;
+  String result = String((char*)buf);
+  free(buf);
+  return result;
+}
+
+bool refreshSpotifyAccessToken() {
+  if (millis() < spotifyTokenExpiresAt && cachedSpotifyAccessToken != "") return true;
+
+  WiFiClientSecure tokenClient;
+  tokenClient.setInsecure();
+  HTTPClient http;
+  http.begin(tokenClient, "https://accounts.spotify.com/api/token");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("Authorization", "Basic " + base64Encode(String(clientId) + ":" + String(clientSecret)));
+
+  String body = "grant_type=refresh_token&refresh_token=" + String(refreshToken);
+  int code = http.POST(body);
+
+  bool ok = false;
+  if (code == HTTP_CODE_OK) {
+    String resp = http.getString();
+    int tIdx = resp.indexOf("\"access_token\":\"");
+    if (tIdx != -1) {
+      tIdx += strlen("\"access_token\":\"");
+      int endQuote = resp.indexOf("\"", tIdx);
+      cachedSpotifyAccessToken = resp.substring(tIdx, endQuote);
+
+      long expiresIn = 3600;
+      int eIdx = resp.indexOf("\"expires_in\":");
+      if (eIdx != -1) {
+        int numStart = eIdx + strlen("\"expires_in\":");
+        expiresIn = resp.substring(numStart, resp.indexOf(",", numStart)).toInt();
+      }
+      spotifyTokenExpiresAt = millis() + (expiresIn - 60) * 1000UL; // refresh a minute early
+      ok = true;
+    }
+  }
+  http.end();
+  return ok;
+}
+
+// PUT https://api.spotify.com/v1/me/tracks?ids=<id> -- Spotify's "Save
+// Track" endpoint (the heart/Like button).
+bool likeCurrentSpotifyTrack() {
+  UI_LOCK();
+  String trackId = currentSpotifyTrackId;
+  UI_UNLOCK();
+  if (trackId == "") return false;
+  if (!refreshSpotifyAccessToken()) return false;
+
+  WiFiClientSecure likeClient;
+  likeClient.setInsecure();
+  HTTPClient http;
+  http.begin(likeClient, "https://api.spotify.com/v1/me/tracks?ids=" + trackId);
+  http.addHeader("Authorization", "Bearer " + cachedSpotifyAccessToken);
+  http.addHeader("Content-Length", "0");
+  int code = http.PUT((uint8_t*)nullptr, 0);
+  http.end();
+
+  return code == 200 || code == 204;
+}
+#endif
+
+#if ENABLE_GAPLESS_PREFETCH
+// ==========================================
+// 6d. GAPLESS PREFETCH (SD warm-up -- see the honesty note near the state
+// declarations above for what this does and doesn't guarantee)
+// ==========================================
+void maybePrefetchNextTrack() {
+  if (appState != STATE_SD_PLAYING || trackCount == 0) return;
+
+  AUDIO_LOCK();
+  bool running = audio.isRunning();
+  int cur = running ? audio.getAudioCurrentTime() : 0;
+  int dur = running ? audio.getAudioFileDuration() : 0;
+  AUDIO_UNLOCK();
+
+  if (!running || dur <= 0) return;
+
+  int remaining = dur - cur;
+  int nextIdx = (currentTrackIndex + 1) % trackCount;
+
+  if (remaining <= 3 && remaining >= 0 && nextTrackPreopenedIdx != nextIdx) {
+    AUDIO_LOCK();
+    if (nextTrackPreopened) nextTrackPreopened.close();
+
+    String path = trackList[nextIdx];
+    if (!path.startsWith("/")) path = "/" + path;
+    nextTrackPreopened = SD.open(path);
+
+    if (nextTrackPreopened) {
+
+      uint8_t warm[4096];
+      nextTrackPreopened.read(warm, sizeof(warm));
+      nextTrackPreopened.seek(0);
+      nextTrackPreopenedIdx = nextIdx;
+    }
+    AUDIO_UNLOCK();
+  }
+}
+#endif
+
 void performWiFiSync() {
-  // 1. Stop audio playback to free up the SD card SPI bus safely
   AUDIO_LOCK();
   audio.stopSong();
   AUDIO_UNLOCK();
   isPlaying = false;
+
+  DISPLAY_LOCK();
 
   tft.fillScreen(ST77XX_BLACK);
   drawCyberBackground();
@@ -795,6 +1231,7 @@ void performWiFiSync() {
     tft.print("SERVER NOT FOUND!");
     http.end();
     delay(2000);
+    DISPLAY_UNLOCK();
     enterMenu();
     return;
   }
@@ -853,6 +1290,7 @@ void performWiFiSync() {
   tft.setCursor(10, 10);
   tft.print("SYNC COMPLETE!");
   delay(2000);
+  DISPLAY_UNLOCK();
   scanSDTracks();
   enterMenu();
 }
@@ -884,23 +1322,31 @@ void enterSDPlayer() {
 }
 
 void drawMenuStatic() {
+  DISPLAY_LOCK();
   drawCyberBackground();
   tft.setTextSize(1);
   tft.setTextColor(COL_DIMMER);
   tft.setCursor(4, 119);
   tft.print("made by cwik3");
+  DISPLAY_UNLOCK();
+#if ENABLE_BATTERY_MON
+  drawBatteryIcon(136, 4);
+#endif
 }
 
 void drawMenuButtons() {
   const int btnW = 130, btnH = 28, gap = 8;
   const int totalH = MENU_COUNT * btnH + (MENU_COUNT - 1) * gap;
   const int startY = (128 - totalH) / 2;
+  DISPLAY_LOCK();
   for (int i = 0; i < MENU_COUNT; i++) {
     drawGlassButton(15, startY + i * (btnH + gap), btnW, btnH, menuItems[i], i == menuIndex);
   }
+  DISPLAY_UNLOCK();
 }
 
 void drawSpotifyStatic() {
+  DISPLAY_LOCK();
   drawCyberBackground();
  
   if (coverCacheValid) {
@@ -909,6 +1355,7 @@ void drawSpotifyStatic() {
     drawGlassPanel(COVER_X, COVER_Y, COVER_W, COVER_H);
   }
   drawGlassPanel(INFO_X, INFO_Y, INFO_W, INFO_H);
+  DISPLAY_UNLOCK();
  
   artistMarquee.text = "";
   trackMarquee.text = "";
@@ -916,15 +1363,26 @@ void drawSpotifyStatic() {
 }
 
 void drawSpotifyDynamic() {
+  // Snapshot the shared Spotify fields under uiStateMutex before using
+  // them, since networkTask's spotifyCallback() can be mid-write to these
+  // at any moment.
+  UI_LOCK();
+  long baseProgressMs = spotifyProgressMs;
+  long durationMs = spotifyDurationMs;
+  bool playingNow = spotifyIsPlaying;
+  unsigned long capturedAt = spotifyProgressCapturedAt;
+  UI_UNLOCK();
+
+  DISPLAY_LOCK();
   tft.setTextSize(1);
 
-  long elapsedMs = spotifyProgressMs;
-  if (spotifyIsPlaying) {
-    elapsedMs += (long)(millis() - spotifyProgressCapturedAt);
+  long elapsedMs = baseProgressMs;
+  if (playingNow) {
+    elapsedMs += (long)(millis() - capturedAt);
   }
-  elapsedMs = constrain(elapsedMs, 0, spotifyDurationMs);
+  elapsedMs = constrain(elapsedMs, 0, durationMs);
   int curSec = elapsedMs / 1000;
-  int durSec = spotifyDurationMs / 1000;
+  int durSec = durationMs / 1000;
 
   char timeBuf[16];
   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d/%02d:%02d", curSec / 60, curSec % 60, durSec / 60, durSec % 60);
@@ -932,13 +1390,31 @@ void drawSpotifyDynamic() {
 
   drawProgressBar(PROGRESS_X, PROGRESS_Y, PROGRESS_W, PROGRESS_H, curSec, durSec);
 
-  if (!spotifyTransportDrawn || spotifyIsPlaying != lastDrawnSpotifyPlaying) {
-    lastDrawnSpotifyPlaying = spotifyIsPlaying;
+  if (!spotifyTransportDrawn || playingNow != lastDrawnSpotifyPlaying) {
+    lastDrawnSpotifyPlaying = playingNow;
     spotifyTransportDrawn = true;
   }
+  DISPLAY_UNLOCK();
+
+#if ENABLE_SPOTIFY_LIKE
+
+  static bool likedRowActive = false;
+  bool likeNow = millis() < likedFlashUntil;
+  if (likeNow != likedRowActive) {
+    DISPLAY_LOCK();
+    if (likeNow) {
+      drawClearedText(INFO_X + 4, INFO_Y + 44, INFO_W - 8, "<3 LIKED!", COL_MAGENTA, COL_PANEL);
+    } else {
+      drawClearedText(INFO_X + 4, INFO_Y + 44, INFO_W - 8, "", COL_DIM, COL_PANEL);
+    }
+    DISPLAY_UNLOCK();
+    likedRowActive = likeNow;
+  }
+#endif
 }
 
 void drawSDPlayerStatic() {
+  DISPLAY_LOCK();
   drawCyberBackground();
   trackMarquee.text = "";
   lastDrawnSDTrackIndex = -1;
@@ -949,6 +1425,7 @@ void drawSDPlayerStatic() {
     tft.setTextColor(COL_MAGENTA);
     tft.setCursor(4, 40);
     tft.print("SD CARD NOT DETECTED");
+    DISPLAY_UNLOCK();
     return;
   }
 
@@ -970,7 +1447,8 @@ void drawSDPlayerStatic() {
     tft.setCursor(4, 4);
     tft.print("DJ MIXER");
 
-    const char* labels[] = {"VOL", "BAS", "MID", "HIG", "PAN"};
+    // 5th label reflects whichever mode POT5 is currently in.
+    const char* labels[5] = {"VOL", "BAS", "MID", "HIG", pot5IsSpeedMode ? "SPD" : "PAN"};
     for (int i = 0; i < 5; i++) {
       int cx = 16 + i * 32; 
       
@@ -985,6 +1463,7 @@ void drawSDPlayerStatic() {
       tft.print(labels[i]);
     }
   }
+  DISPLAY_UNLOCK();
 }
 
 void drawSDPlayerDynamic() {
@@ -996,6 +1475,7 @@ void drawSDPlayerDynamic() {
   int dur = running ? audio.getAudioFileDuration() : 0;
   AUDIO_UNLOCK();
 
+  DISPLAY_LOCK();
   if (!isDjMixerActive) {
     tft.setTextSize(1);
     if (currentTrackIndex != lastDrawnSDTrackIndex) {
@@ -1003,6 +1483,22 @@ void drawSDPlayerDynamic() {
       snprintf(trkBuf, sizeof(trkBuf), "Track %d/%d", trackCount > 0 ? currentTrackIndex + 1 : 0, trackCount);
       drawClearedText(INFO_X + 4, INFO_Y + 8, INFO_W - 8, trkBuf, COL_ACID, COL_PANEL);
       lastDrawnSDTrackIndex = currentTrackIndex;
+    }
+
+    static float lastDrawnSpeed = -1.0f;
+    static int8_t lastDrawnPan = -100;
+    if (pot5IsSpeedMode) {
+      if (fabs(currentSpeedMod - lastDrawnSpeed) > 0.005f) {
+        drawSpeedIndicator(76, 114, 40, currentSpeedMod);
+        lastDrawnSpeed = currentSpeedMod;
+        lastDrawnPan = -100; // force a redraw if we switch back to pan mode
+      }
+    } else {
+      if (currentPanValue != lastDrawnPan) {
+        drawPanIndicator(76, 114, 40, currentPanValue);
+        lastDrawnPan = currentPanValue;
+        lastDrawnSpeed = -1.0f; // force a redraw if we switch back to speed mode
+      }
     }
 
     char timeBuf[16];
@@ -1022,15 +1518,33 @@ void drawSDPlayerDynamic() {
     }
 
   } else {
+    // Live pan/speed readout, right side near the "DJ MIXER" title -- runs
+    // every dynamic pass (30ms cadence in DJ mode), same as the faders.
+    static float lastDrawnSpeedDj = -1.0f;
+    static int8_t lastDrawnPanDj = -100;
+    if (pot5IsSpeedMode) {
+      if (fabs(currentSpeedMod - lastDrawnSpeedDj) > 0.005f) {
+        drawSpeedIndicator(100, 4, 56, currentSpeedMod);
+        lastDrawnSpeedDj = currentSpeedMod;
+        lastDrawnPanDj = -100;
+      }
+    } else {
+      if (currentPanValue != lastDrawnPanDj) {
+        drawPanIndicator(100, 4, 56, currentPanValue);
+        lastDrawnPanDj = currentPanValue;
+        lastDrawnSpeedDj = -1.0f;
+      }
+    }
+
     drawProgressBar(4, 25, 152, 4, cur, dur);
 
     int volVal = map(smoothVol, 0, 4095, 0, 60);
     int basVal = map(smoothBass, 0, 4095, 0, 60);
     int midVal = map(smoothMid, 0, 4095, 0, 60);
     int higVal = map(smoothHigh, 0, 4095, 0, 60);
-    int panVal = map(smoothBal, 0, 4095, 0, 60);
+    int pot5Val = map(smoothPot5, 0, 4095, 0, 60);
 
-    int currentVals[5] = {volVal, basVal, midVal, higVal, panVal};
+    int currentVals[5] = {volVal, basVal, midVal, higVal, pot5Val};
 
     for (int i = 0; i < 5; i++) {
       if (currentVals[i] != lastDrawnSliders[i]) {
@@ -1044,7 +1558,6 @@ void drawSDPlayerDynamic() {
 
         int newY = 100 - currentVals[i];
         
-        // ADAPTIVE COLOR FADER LOGIC: Selects black or white based on the gradient brightness behind it
         uint16_t faderColor = (themeGradient[newY] > 0x7FFF) ? ST77XX_BLACK : ST77XX_WHITE;
         tft.fillCircle(cx, newY, 4, faderColor);
         
@@ -1056,9 +1569,11 @@ void drawSDPlayerDynamic() {
       }
     }
   }
+  DISPLAY_UNLOCK();
 }
 
 void drawSDBrowseStatic() {
+  DISPLAY_LOCK();
   drawCyberBackground();
   tft.setTextSize(1);
   tft.setTextColor(COL_MAGENTA);
@@ -1066,19 +1581,23 @@ void drawSDBrowseStatic() {
   tft.print("SELECT TRACK");
   tft.setTextColor(COL_DIM);
   tft.setCursor(4, 116);
+  DISPLAY_UNLOCK();
 }
 
 void drawSDBrowseList() {
+  DISPLAY_LOCK();
   if (!sdMounted) {
     tft.setTextColor(COL_MAGENTA);
     tft.setCursor(4, 50);
     tft.print("SD CARD NOT DETECTED");
+    DISPLAY_UNLOCK();
     return;
   }
   if (trackCount == 0) {
     tft.setTextColor(COL_MAGENTA);
     tft.setCursor(4, 50);
     tft.print("NO MP3 FILES FOUND");
+    DISPLAY_UNLOCK();
     return;
   }
 
@@ -1089,6 +1608,7 @@ void drawSDBrowseList() {
     bool isSelected = (i == 0);
     drawGlassButton(8, startY + (i * 26), 144, 22, trackList[idx].c_str(), isSelected);
   }
+  DISPLAY_UNLOCK();
 }
 
 // ==========================================
@@ -1151,26 +1671,77 @@ void handleSW1SW2() {
   bool sw1State = digitalRead(SW1_PIN);
   bool sw2State = digitalRead(SW2_PIN);
 
+#if ENABLE_SPOTIFY_LIKE
+  // SW1 press/hold tracking. Short press keeps its original meaning
+  // (skip); a long press ONLY does something different in STATE_SPOTIFY,
+  // where it fires "Like" instead. SD player behavior is unchanged.
+  if (sw1LastState == HIGH && sw1State == LOW) {
+    sw1PressStart = millis();
+    sw1LongTriggered = false;
+  }
+  if (sw1State == LOW && !sw1LongTriggered && millis() - sw1PressStart > LONG_PRESS_MS) {
+    sw1LongTriggered = true;
+    if (appState == STATE_SPOTIFY && wifiMulti.run() == WL_CONNECTED) {
+      if (likeCurrentSpotifyTrack()) {
+        likedFlashUntil = millis() + 1500;
+      }
+    }
+  }
+#endif
+
+  // SW2 press/hold tracking. Short press keeps its original meaning
+  // (Play/Pause, fires on release below); a long press during SD playback
+  // toggles POT5 between Pan and Speed mode instead. Outside SD_PLAYING,
+  // holding SW2 does nothing extra -- it just falls through to nothing on
+  // release, same as before this feature existed.
+  if (sw2LastState == HIGH && sw2State == LOW) {
+    sw2PressStart = millis();
+    sw2LongTriggered = false;
+  }
+  if (sw2State == LOW && !sw2LongTriggered && millis() - sw2PressStart > LONG_PRESS_MS) {
+    sw2LongTriggered = true;
+    if (appState == STATE_SD_PLAYING) {
+      pot5IsSpeedMode = !pot5IsSpeedMode;
+      resetInactivePot5Control();
+      pot5NeedsReapply = true;
+      screenNeedsFullDraw = true; // redraw DJ mixer label / readout immediately
+    }
+  }
+
   if (millis() - lastButtonAction > BUTTON_DEBOUNCE) {
-    if (sw1LastState == HIGH && sw1State == LOW) {
-      if (appState == STATE_SPOTIFY) {
-        if (wifiMulti.run() == WL_CONNECTED) spotify.nextTrack();
-      } else if (appState == STATE_SD_PLAYING) {
-        playTrack(currentTrackIndex + 1);
+    if (sw1LastState == LOW && sw1State == HIGH) {
+      // Skip fires on release (not press) so a long-press-triggered Like
+      // in STATE_SPOTIFY can preempt it via the wasLong check below.
+      bool wasLong =
+#if ENABLE_SPOTIFY_LIKE
+        sw1LongTriggered;
+#else
+        false;
+#endif
+      if (!wasLong) {
+        if (appState == STATE_SPOTIFY) {
+          if (wifiMulti.run() == WL_CONNECTED) spotify.nextTrack();
+        } else if (appState == STATE_SD_PLAYING) {
+          playTrack(currentTrackIndex + 1);
+        }
       }
       lastButtonAction = millis();
     }
-    if (sw2LastState == HIGH && sw2State == LOW) {
-      if (appState == STATE_SPOTIFY) {
-        if (wifiMulti.run() == WL_CONNECTED) {
-          if (spotifyIsPlaying) spotify.pause();
-          else spotify.play();
+    if (sw2LastState == LOW && sw2State == HIGH) {
+      // Same pattern as SW1 above: a long-press-triggered mode toggle
+      // preempts the short-press Play/Pause action on release.
+      if (!sw2LongTriggered) {
+        if (appState == STATE_SPOTIFY) {
+          if (wifiMulti.run() == WL_CONNECTED) {
+            if (spotifyIsPlaying) spotify.pause();
+            else spotify.play();
+          }
+        } else if (appState == STATE_SD_PLAYING) {
+          isPlaying = !isPlaying;
+          AUDIO_LOCK();
+          audio.pauseResume();
+          AUDIO_UNLOCK();
         }
-      } else if (appState == STATE_SD_PLAYING) {
-        isPlaying = !isPlaying;
-        AUDIO_LOCK();
-        audio.pauseResume();
-        AUDIO_UNLOCK();
       }
       lastButtonAction = millis();
     }
@@ -1181,7 +1752,6 @@ void handleSW1SW2() {
 }
 
 void applyFallbackCover() {
-  // Pick a random backup cover from 1 to 4
   int randCover = random(1, 5); 
   String fallbackPath = "/backup" + String(randCover) + ".jpg";
 
@@ -1213,15 +1783,98 @@ void applyFallbackCover() {
 }
 
 // ==========================================
+// 8b. NETWORK TASK (medium priority)
+// ==========================================
+// Owns everything that isn't real-time-critical audio and isn't direct user
+// input: Wi-Fi sync, Spotify polling + cover art, and the "no embedded
+// cover art at all" timeout. Keeping this off the UI task means a Spotify
+// poll or a JPEG decode never makes the encoder/buttons feel laggy.
+void networkTask(void *parameter) {
+  while (true) {
+
+    if (appState == STATE_SYNC) {
+      performWiFiSync();
+    }
+
+    // --- Spotify status polling + cover art ---
+    if (appState == STATE_SPOTIFY && millis() - lastSpotifyCheck > 5000) {
+      if (wifiMulti.run() == WL_CONNECTED) {
+        spotify.getCurrentlyPlaying(spotifyCallback);
+
+        if (currentSpotifyUrl != lastSpotifyUrl && currentSpotifyUrl != "") {
+          lastSpotifyUrl = currentSpotifyUrl;
+
+          if (downloadSpotifyCover(currentSpotifyUrl)) {
+            AUDIO_LOCK();
+            File check = SD.open("/spoty.jpg");
+            bool progressive = check && jpegIsProgressive(check);
+            if (check) check.close();
+            AUDIO_UNLOCK();
+ 
+            if (progressive) {
+              coverCacheValid = false;
+              clearCoverCache();
+              clearCoverBox();
+              applyFallbackCover();
+            } else {
+              clearCoverCache(); 
+              AUDIO_LOCK();
+              TJpgDec.setJpgScale(1);
+              TJpgDec.drawFsJpg(SPOTIFY_IMG_X, SPOTIFY_IMG_Y, "/spoty.jpg", SD);
+              AUDIO_UNLOCK();
+
+              if (coverLooksBlack()) {
+                applyFallbackCover();
+              } else {
+                coverCacheValid = true;
+                coverThemeDirty = true;
+                screenNeedsFullDraw = true;
+              }
+            }
+          } else {
+            applyFallbackCover();
+          }
+        }
+      } else {
+        UI_LOCK();
+        currentTrack = "Wi-Fi Lost!";
+        currentArtist = "Searching...";
+        UI_UNLOCK();
+      }
+      lastSpotifyCheck = millis();
+    }
+
+    // --- SD tracks with no embedded cover tag at all never trigger
+    // audio_id3image(), so this timeout is what decides "not coming" and
+    // shows a backup cover instead of leaving the panel blank forever.
+    if (appState == STATE_SD_PLAYING && coverPending &&
+        millis() - coverPendingSince > COVER_FETCH_TIMEOUT_MS) {
+      coverPending = false;
+      if (!coverCacheValid) {
+        applyFallbackCover();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// ==========================================
 // 9. SETUP
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  
-  delay(250); 
-  while (!Serial) { delay(10); }
+  unsigned long waitStart = millis();
+  while(!Serial && (millis() - waitStart < 2000)) {
+    delay(10);
+  }
 
   audioMutex = xSemaphoreCreateRecursiveMutex();
+  displayMutex = xSemaphoreCreateRecursiveMutex();
+  uiStateMutex = xSemaphoreCreateMutex();
+#if ENABLE_FFT_SPECTRUM
+  spectrumMutex = xSemaphoreCreateMutex();
+#endif
   randomSeed(esp_random()); 
 
   Serial.println("\n--- Initializing Wi-Fi ---");
@@ -1254,8 +1907,28 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
   initCyberPalette();
 
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  pinMode(SD_MISO, INPUT_PULLUP);
+  
   spiSD.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
   sdMounted = SD.begin(SD_CS, spiSD, 4000000);
+
+  if (!sdMounted) {
+    Serial.println("Cold boot mount failed. Flushing SPI bus and warm-booting SD...");
+    spiSD.end();
+    delay(500);
+    
+    digitalWrite(SD_CS, HIGH);
+    spiSD.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
+    sdMounted = SD.begin(SD_CS, spiSD, 4000000);
+  }
+
+  if (sdMounted) {
+    Serial.println("SD Card successfully mounted!");
+  } else {
+    Serial.println("CRITICAL FAULT: SD Card unresponsive.");
+  }
 
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(false);
@@ -1264,88 +1937,44 @@ void setup() {
   audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   audio.setVolume(10);
 
-  xTaskCreatePinnedToCore(audioTask, "AudioTask", 10000, NULL, 1, NULL, 0);
+  // Priority scheme: audio (3, high) > network (2, medium) > loop()/UI (1,
+  // low, default Arduino priority -- unchanged). Audio stays pinned to
+  // core 0 so it's never fighting the UI/network tasks for CPU time on
+  // core 1; network is deliberately NOT pinned to core 0 so it can't add
+  // jitter to decode timing either.
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 10000, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 2, NULL, 1);
 
   lastMenuEncoderValue = encoderValue;
   enterMenu();
 }
 
 // ==========================================
-// 10. MAIN LOOP
+// 10. MAIN LOOP -- low-priority UI task: encoder, buttons, TFT redraw.
+// Nothing here blocks on the network or on SD decode work anymore; the
+// heaviest thing it does is a screen redraw or a JPEG blit from RAM.
 // ==========================================
 void loop() {
   handleEncoderSwitch();
   handleSW1SW2();
+  updateDSP();
 
   if (millis() - lastHeapLog > 15000) {
     lastHeapLog = millis();
-  }
-  if (appState == STATE_SPOTIFY && millis() - lastSpotifyCheck > 5000) {
-    if (wifiMulti.run() == WL_CONNECTED) {
-      spotify.getCurrentlyPlaying(spotifyCallback);
-
-      if (currentSpotifyUrl != lastSpotifyUrl && currentSpotifyUrl != "") {
-        lastSpotifyUrl = currentSpotifyUrl;
-
-        if (downloadSpotifyCover(currentSpotifyUrl)) {
-          AUDIO_LOCK();
-          File check = SD.open("/spoty.jpg");
-          bool progressive = check && jpegIsProgressive(check);
-          if (check) check.close();
-          AUDIO_UNLOCK();
- 
-          if (progressive) {
-            coverCacheValid = false;
-            clearCoverCache();
-            clearCoverBox();
-            applyFallbackCover();
-          } else {
-            clearCoverCache(); 
-            AUDIO_LOCK();
-            TJpgDec.setJpgScale(1);
-            TJpgDec.drawFsJpg(SPOTIFY_IMG_X, SPOTIFY_IMG_Y, "/spoty.jpg", SD);
-            AUDIO_UNLOCK();
-
-            if (coverLooksBlack()) {
-              applyFallbackCover();
-            } else {
-              coverCacheValid = true;
-              coverThemeDirty = true;
-              screenNeedsFullDraw = true;
-            }
-          }
-        } else {
-          applyFallbackCover();
-        }
-      }
-    } else {
-      currentTrack = "Wi-Fi Lost!";
-      currentArtist = "Searching...";
-    }
-    lastSpotifyCheck = millis();
-  }
-
-  if (appState == STATE_SD_PLAYING) {
-    int vol = readSmoothedVolume();
-    AUDIO_LOCK();
-    audio.setVolume(vol);
-    AUDIO_UNLOCK(); 
-    updateDSP(); 
-    if (coverPending && millis() - coverPendingSince > COVER_FETCH_TIMEOUT_MS) {
-      coverPending = false;
-      if (!coverCacheValid) {
-        applyFallbackCover();
-      }
-    }
   }
 
   if (millis() - lastMarqueeTime > MARQUEE_STEP_MS) {
     lastMarqueeTime = millis();
     if (appState == STATE_SPOTIFY) {
-      marqueeSetText(artistMarquee, currentArtist, INFO_W - 8, COL_ACID, COL_PANEL);
+      UI_LOCK();
+      String artistSnapshot = currentArtist;
+      String trackSnapshot = currentTrack;
+      UI_UNLOCK();
+
+      marqueeSetText(artistMarquee, artistSnapshot, INFO_W - 8, COL_ACID, COL_PANEL);
       marqueeDraw(artistMarquee, INFO_X + 4, INFO_Y + 8, COL_PANEL);
 
-      marqueeSetText(trackMarquee, currentTrack, NAME_W - 4, COL_ACID, COL_BG_BOT);
+      marqueeSetText(trackMarquee, trackSnapshot, NAME_W - 4, COL_ACID, COL_BG_BOT);
       marqueeDraw(trackMarquee, NAME_X, NAME_Y, COL_BG_BOT);
     } else if (appState == STATE_SD_PLAYING && sdMounted) {
       String name = trackCount > 0 ? trackList[currentTrackIndex] : "No files";
@@ -1363,6 +1992,8 @@ void loop() {
     }
   }
 
+  // --- STATE DISPATCH. Note there's no STATE_SYNC branch here anymore --
+  // networkTask owns that screen entirely (see networkTask() above). ---
   if (appState == STATE_MENU) {
     if (screenNeedsFullDraw) {
       drawMenuStatic();
@@ -1399,12 +2030,6 @@ void loop() {
       screenNeedsFullDraw = false;
     }
   }
-  else if (appState == STATE_SYNC) {
-    if (screenNeedsFullDraw) {
-      screenNeedsFullDraw = false;
-      performWiFiSync();
-    }
-  }
 
   if (appState == STATE_SD_PLAYING) {
     if (isDjMixerActive && millis() - lastUITime > 30) {
@@ -1423,4 +2048,31 @@ void loop() {
     }
     lastSpotifyUITime = millis();
   }
+
+#if ENABLE_BATTERY_MON
+  updateBattery();
+  static unsigned long lastBattDrawTime = 0;
+  if (appState == STATE_MENU && millis() - lastBattDrawTime > 2000) {
+    drawBatteryIcon(136, 4);
+    lastBattDrawTime = millis();
+  }
+#endif
+
+#if ENABLE_FFT_SPECTRUM
+  static unsigned long lastSpectrumTime = 0;
+  if (appState == STATE_SD_PLAYING && !isDjMixerActive && isPlaying &&
+      millis() - lastSpectrumTime > 40) {
+    computeSpectrum();
+    drawSpectrumBars(4, 112, 112, 14);
+    lastSpectrumTime = millis();
+  }
+#endif
+
+#if ENABLE_GAPLESS_PREFETCH
+  static unsigned long lastPrefetchCheck = 0;
+  if (appState == STATE_SD_PLAYING && millis() - lastPrefetchCheck > 500) {
+    maybePrefetchNextTrack();
+    lastPrefetchCheck = millis();
+  }
+#endif
 }
