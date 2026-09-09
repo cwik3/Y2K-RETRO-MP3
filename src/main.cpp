@@ -15,15 +15,57 @@
 #include <HTTPClient.h>
 #include <driver/i2s.h>
 #include <math.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 #define SERVER_IP "192.168.1.182"
 
-// Flip any of these to 0 if it doesn't compile 
-#define ENABLE_FFT_SPECTRUM     0   // real-time spectrum bars only for SD 
+// ==========================================
+// NEW-FEATURE TOGGLES
+// Flip any of these to 0 if it doesn't compile cleanly against your
+// installed library versions -- each feature's code is fully isolated
+// behind its #if block, so disabling one never affects the others or the
+// core player.
+// ==========================================
+#define ENABLE_FFT_SPECTRUM     0   // real-time spectrum bars, SD playback only -- disabled: audio_process_raw_samples hook never produced usable data even after trying RAW_SAMPLE_SHIFT and swapping L/R stride, so this feature is dropped rather than kept guessing blind
 #define ENABLE_BATTERY_MON      0   // battery % icon on the menu screen
 #define ENABLE_SPOTIFY_LIKE     0   // long-press SW1 in Spotify view = Like
 #define ENABLE_GAPLESS_PREFETCH 1   // SD-cache warm-up before track end
 
 #if ENABLE_FFT_SPECTRUM
+// CORRECTED HOOK (previous version called a function named `audio_process`
+// that does not exist anywhere in schreibfaul1/ESP32-audioI2S -- it never
+// linked, so the spectrum could never have worked). The real weak symbols,
+// verified directly against the library's Audio.h / Audio.cpp on GitHub:
+//
+//   extern __attribute__((weak)) void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples);
+//   extern __attribute__((weak)) void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S);
+//
+// raw_samples fires BEFORE volume/gain/EQ (closer to the source audio,
+// which is what we want for a spectrum display); audio_process_i2s fires
+// after, and had a documented signature-mismatch bug between Audio.h and
+// Audio.cpp in v3.3.0 (GitHub issue #1052) -- raw_samples sidesteps that,
+// so that's what this uses.
+//
+// Two things I can't verify without your actual hardware/library version:
+//  1. Whether outBuff samples are effectively 16-bit magnitude stored in a
+//     32-bit container, or genuinely scaled across the full 32-bit range.
+//     RAW_SAMPLE_SHIFT below controls this -- 0 = no shift (current guess).
+//     If bars sit pinned at max, try RAW_SAMPLE_SHIFT 8 or 16.
+//  2. Whether outBuff is interleaved stereo (L,R,L,R...) or already
+//     single-channel. This assumes interleaved and strides by 2 -- if the
+//     spectrum looks like silence/noise regardless of volume, try removing
+//     the stride (read every sample, not every other one).
+// If it still doesn't move after those two tweaks, that's a real signal to
+// set ENABLE_FFT_SPECTRUM to 0 and drop the feature rather than keep
+// guessing blind.
+//
+// This targets the arduinoFFT v2.x templated API (ArduinoFFT<double>,
+// lowercase methods, FFTWindow::/FFTDirection:: enums). If Library Manager
+// gave you v1.x instead, you'll see errors here -- v1 uses a non-templated
+// `arduinoFFT` class with capitalized methods (Windowing/Compute/
+// ComplexToMagnitude) and #define constants (FFT_WIN_TYP_HAMMING,
+// FFT_FORWARD) instead of enums. Swap the two lines in computeSpectrum()
+// accordingly if you're on v1.
 #include <arduinoFFT.h>
 #endif
 
@@ -63,6 +105,11 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define ENC_SW  39
 #define SW1_PIN 47
 #define SW2_PIN 48
+// Tactile momentary button standing in for a slide power switch (wired
+// active-LOW to GND with the internal pull-up). Tap wakes the board from
+// deep sleep; holding 3s while awake powers it down. GPIO15 is RTC-IO
+// capable on the ESP32-S3, which ext0 deep-sleep wakeup requires.
+#define PWR_SW_PIN 15
 
 // ALL SAFE ADC1 PINS
 #define POT1_PIN 1  // Master Volume
@@ -70,11 +117,14 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 #define POT3_PIN 7  // Mid EQ
 #define POT4_PIN 8  // High/Treble EQ
 // Dual-purpose: Pan/Balance by default, Speed/Pitch when toggled. Long-
-// press SW2 while a track is playing to switch modes (see handleSW1SW2()).
+// press SW1 while a track is playing to switch modes (see handleSW1SW2()).
 #define POT5_PIN 9
 
 #if ENABLE_BATTERY_MON
-//need analog fre pin
+// GPIO3 is the last free ADC1-capable pin in this pinout (1,2,7,8,9 are
+// taken by the pots). On ESP32-S3, GPIO3 also doubles as a JTAG strapping
+// pin -- that only matters at reset/boot, so analogRead() on it at runtime
+// is fine, but confirm it's not tied to anything else on your board first.
 #define BATT_PIN 3
 #endif
 
@@ -116,18 +166,39 @@ SpotifyArduino spotify(client, clientId, clientSecret, refreshToken);
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 SPIClass spiSD(HSPI);
 Audio audio;
+
+// Guards SD-card access and the Audio decoder object -- shared between
+// audioTask (core 0) and anything on core 1 that touches the SD card
+// (networkTask's cover downloads, the UI task's playTrack()).
 SemaphoreHandle_t audioMutex;
 #define AUDIO_LOCK()   xSemaphoreTakeRecursive(audioMutex, portMAX_DELAY)
 #define AUDIO_UNLOCK() xSemaphoreGiveRecursive(audioMutex)
+
+// Guards every actual write to the physical TFT (SPI transactions). JPEG
+// decoding itself never touches this -- it only writes into the RAM
+// coverCache[] buffer (see tft_output()) -- but clearCoverBox() can be
+// called from audioTask (auto-advancing a track) at the same moment the UI
+// task is mid-redraw, and performWiFiSync()'s status screen now runs
+// entirely on networkTask. Without this, two tasks issuing SPI commands to
+// the same display at once produces a garbled screen, not just a stutter.
+// Recursive because e.g. drawMenuStatic() -> drawCyberBackground() nests.
 SemaphoreHandle_t displayMutex;
 #define DISPLAY_LOCK()   xSemaphoreTakeRecursive(displayMutex, portMAX_DELAY)
 #define DISPLAY_UNLOCK() xSemaphoreGiveRecursive(displayMutex)
 
+// Guards the Spotify "now playing" text fields, which are Arduino Strings
+// written by networkTask (spotifyCallback) and read by the UI task's
+// marquee. A String assignment isn't atomic -- reading one mid-write is a
+// real crash risk (dereferencing a buffer mid-realloc), not just a glitch.
 SemaphoreHandle_t uiStateMutex;
 #define UI_LOCK()   xSemaphoreTake(uiStateMutex, portMAX_DELAY)
 #define UI_UNLOCK() xSemaphoreGive(uiStateMutex)
 
 #if ENABLE_FFT_SPECTRUM
+// Guards the raw PCM ring buffer, written by audio_process_raw_samples()
+// on audioTask and read by computeSpectrum() on the UI task. Uses a
+// 0-timeout take on the audio-task side so a busy UI task can never stall
+// audio.
 SemaphoreHandle_t spectrumMutex;
 #endif
 
@@ -154,6 +225,7 @@ void enterMenu();
 void applyFallbackCover();
 bool coverLooksBlack();
 void networkTask(void *parameter);
+void enterDeepSleep();
 
 enum AppState { STATE_MENU, STATE_SPOTIFY, STATE_SD_BROWSE, STATE_SD_PLAYING, STATE_SYNC };
 AppState appState = STATE_MENU;
@@ -184,10 +256,27 @@ const unsigned long BUTTON_DEBOUNCE = 250;
 String currentSpotifyUrl = "";
 String lastSpotifyUrl = "none";
 
-#if ENABLE_SPOTIFY_LIKE
-String currentSpotifyTrackId = "";
 bool sw1LongTriggered = false;
 unsigned long sw1PressStart = 0;
+
+bool pwrLastState = HIGH;
+unsigned long pwrPressStart = 0;
+bool pwrLongTriggered = false;
+const unsigned long PWR_HOLD_MS = 3000;
+// If GPIO15 never reads HIGH after boot, it's almost certainly a wiring
+// or solder problem (stuck LOW / shorted to GND / pull-up not actually
+// reaching the pin) rather than a genuine held press -- see
+// handlePowerSwitch() for what this prevents.
+bool pwrPinEverSeenHigh = false;
+const unsigned long PWR_BOOT_GRACE_MS = 4000; // ignore the button this long after boot/wake
+
+#if ENABLE_SPOTIFY_LIKE
+// Track ID of whatever's currently playing, for the "Like" (Save Track)
+// call. Written under UI_LOCK alongside the other Spotify fields.
+// NOTE: verify `trackId` is the actual field name in your installed
+// SpotifyArduino (witnessmenow) version's CurrentlyPlaying struct -- check
+// SpotifyArduino.h if this doesn't compile.
+String currentSpotifyTrackId = "";
 unsigned long likedFlashUntil = 0;
 #endif
 
@@ -229,11 +318,35 @@ int smoothMid  = 2048;
 int smoothHigh = 2048;
 
 // POT5 is dual-purpose now: Pan/Balance by default, Speed when toggled
-int smoothPot5 = 1024;
-const int POT5_CENTER = 1024;
+// (long-press SW2 during SD playback). One shared smoothed reading since
+// it's one physical pot -- which control it drives depends on
+// pot5IsSpeedMode.
+//
+// POT5_CENTER / POT5_DEADZONE: THIS WAS LIKELY THE CAUSE OF YOUR RIGHT-
+// CHANNEL DROPOUT. It was previously set to 1024 on request, but most
+// linear pots wired across 0-3.3V on a 12-bit ADC actually rest around
+// 2048, not 1024. With the old value, an untouched pot at ~2048 read as
+// "turned right" of the 1024-centered deadzone, so Speed mode (the old
+// default) pushed a skewed rate into i2s_set_sample_rates() on every
+// single track load, at rest, with nobody touching the knob -- a raw
+// I2S clock override, unlike setTone()/setBalance() which never touch
+// timing. That's consistent with stereo breaking only after Speed mode
+// started running by default, and only on that channel/timing-sensitive
+// path. Reverted to the standard ADC midpoint here; if your pot's actual
+// physical center measures differently, confirm with
+// Serial.println(analogRead(POT5_PIN)) with the knob centered and adjust
+// this constant to match -- don't guess it back down without checking.
+int smoothPot5 = 2048;
+const int POT5_CENTER = 2048;
 const int POT5_DEADZONE = 150; // +/- around center treated as "neutral"
 
-bool pot5IsSpeedMode = false;   // false = Pan (default), true = Speed
+// Defaulting to Pan (false) rather than Speed: Pan only ever calls
+// audio.setBalance(), a normal library-level control that can't desync
+// I2S timing the way the Speed path's direct i2s_set_sample_rates() call
+// can if POT5_CENTER doesn't match your hardware. Flip back to Speed with
+// SW1-hold once you've confirmed the calibration above and are satisfied
+// stereo stays intact while using it.
+bool pot5IsSpeedMode = false;   // false = Pan (default), true = Speed -- SW1-hold in the SD player toggles
 bool pot5NeedsReapply = false;  // force a re-apply next updateDSP() pass
                                  // (set on track change AND on mode toggle)
 
@@ -253,6 +366,10 @@ float battSmoothedRaw = -1.0f;
 int battPercent = 100;
 unsigned long lastBattRead = 0;
 const unsigned long BATT_READ_INTERVAL_MS = 2000;
+// Adjust these three to your actual circuit before trusting the reading:
+// BATT_DIVIDER_RATIO must match your resistor divider (2.0 = equal-value
+// 100k/100k divider, i.e. ADC sees half of pack voltage). BATT_EMPTY_V /
+// BATT_FULL_V should match your cell chemistry's usable range.
 const float BATT_DIVIDER_RATIO = 2.0f;
 const float BATT_EMPTY_V = 3.3f;
 const float BATT_FULL_V  = 4.2f;
@@ -264,10 +381,20 @@ const float BATT_FULL_V  = 4.2f;
 #if ENABLE_FFT_SPECTRUM
 #define FFT_SAMPLES 256
 #define NUM_BARS 16
-#define RAW_SAMPLE_SHIFT 16
+
+// See the big comment block up near the #include <arduinoFFT.h> for what
+// these two are and how to retune them if the bars are pinned/silent.
+#define RAW_SAMPLE_SHIFT 0
 #define FFT_NORM_DIVISOR 4000.0f
+
+// float, not double: the ESP32-S3's FPU is single-precision-only, so a
+// double FFT silently falls back to software emulation and gets much
+// slower. float uses the hardware FPU directly.
 float fftReal[FFT_SAMPLES];
 float fftImag[FFT_SAMPLES];
+// arduinoFFT v2.x (templated) constructor. Nominal 44.1kHz -- since bars
+// are bucketed by bin *index* not literal Hz labels, mixed-sample-rate SD
+// libraries will still look musically reasonable, just not frequency-exact.
 ArduinoFFT<float> FFT(fftReal, fftImag, FFT_SAMPLES, 44100.0f);
 
 int16_t pcmRing[FFT_SAMPLES];
@@ -282,6 +409,15 @@ float barPeak[NUM_BARS] = {0};
 // 3e. GAPLESS PREFETCH STATE
 // ==========================================
 #if ENABLE_GAPLESS_PREFETCH
+// Honest scope note: this warms the SD driver/FAT cache for the next file
+// a few seconds before the current one ends, which is the actual source of
+// most of the audible "stall" on a track change (mount + first-read
+// latency). It is NOT sample-accurate gapless playback -- most consumer
+// MP3s have encoder padding/silence at their edges that only a
+// gapless-aware format (or LAME header parsing + trimming) can fully
+// eliminate, and that's a much bigger lift than firmware alone can
+// reliably solve for arbitrary files. This gets you a snappier handoff,
+// not a guaranteed zero-gap crossfade.
 File nextTrackPreopened;
 int nextTrackPreopenedIdx = -1;
 #endif
@@ -354,6 +490,10 @@ void updateThemeFromCover() {
 #endif
 }
 
+// NOTE: does not lock displayMutex itself -- it's called from within
+// several already-locked top-level draw functions (recursive-safe), and
+// from inside performWiFiSync() (also locked). Never call this directly
+// from a task loop body without wrapping it.
 void drawCyberBackground() {
   if (coverThemeDirty) {
     updateThemeFromCover();
@@ -601,6 +741,9 @@ void marqueeDraw(Marquee &m, int x, int y, uint16_t bg) {
 // ==========================================
 // 5. TJpg / ENCODER ISR / AUDIO TASK
 // ==========================================
+// Only ever writes into the RAM coverCache[] buffer -- never touches the
+// physical tft -- so decoding a cover from any task never needs
+// displayMutex. Only the UI task's drawCurrentSDCover() blits it to screen.
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   int minX = COVER_CLIP_MINX, maxX = COVER_CLIP_MAXX;
   int minY = COVER_CLIP_MINY, maxY = COVER_CLIP_MAXY;
@@ -690,6 +833,10 @@ bool coverLooksBlack() {
   return sampled > 0 && (blackCount * 100 / sampled) > 90;
 }
 
+// Runs on audioTask (called synchronously from inside audio.loop() during
+// ID3 parsing). Everything here is SD + RAM-buffer only -- no tft touches
+// -- so it doesn't need displayMutex, only AUDIO_LOCK (already recursive,
+// already held by the caller).
 void audio_id3image(File& file, const size_t pos, const size_t size) {
   AUDIO_LOCK();
   File cover = SD.open("/cover.jpg", FILE_WRITE);
@@ -756,6 +903,14 @@ void audio_id3image(File& file, const size_t pos, const size_t size) {
 // ==========================================
 // 5b. SPECTRUM ANALYZER
 // ==========================================
+// Runs on audioTask -- keep this extremely cheap since it's at audio
+// priority. Uses a 0-timeout mutex take so a busy UI task computing the FFT
+// can NEVER make audio stall waiting for this lock.
+//
+// Signature must match Audio.h EXACTLY (int32_t*, int16_t) or this weak
+// override silently fails to link and nothing here ever runs -- verified
+// against the library source, see the big comment block near the top of
+// this file for the exact declaration and version caveats.
 void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples) {
   if (xSemaphoreTake(spectrumMutex, 0) != pdTRUE) return;
   // Assumed interleaved stereo (L,R,L,R,...), taking the left channel only
@@ -774,6 +929,8 @@ void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples) {
   xSemaphoreGive(spectrumMutex);
 }
 
+// UI-task-only: pulls a snapshot, runs the FFT, and buckets the result into
+// bars. This is the "heavy" part, deliberately kept off audioTask.
 void computeSpectrum() {
   if (!pcmRingFull) return;
   if (xSemaphoreTake(spectrumMutex, 0) != pdTRUE) return;
@@ -788,6 +945,9 @@ void computeSpectrum() {
   FFT.compute(FFTDirection::Forward);
   FFT.complexToMagnitude();
 
+  // Squared bin-index grouping: low bars get one bin each, high bars get
+  // many grouped together -- a cheap approximation of a log-frequency
+  // scale, without needing actual log() calls per bin.
   const int usableBins = FFT_SAMPLES / 2;
   for (int bar = 0; bar < NUM_BARS; bar++) {
     int startBin = (int)(pow((float)bar / NUM_BARS, 2.0f) * usableBins) + 1;
@@ -802,7 +962,13 @@ void computeSpectrum() {
       count++;
     }
     float avg = count > 0 ? (sum / count) : 0.0f;
+    // FFT_NORM_DIVISOR is a rough normalization for typical PCM magnitude
+    // at moderate volume -- tune to taste (see comment near its #define)
+    // if bars run pinned or barely move.
     float norm = constrain(avg / FFT_NORM_DIVISOR, 0.0f, 1.0f);
+
+    // Fast attack, slow release -- classic VU-meter ballistics, and what
+    // gives the "falling bars" look instead of a jittery readout.
     barMagnitude[bar] = (norm > barMagnitude[bar]) ? norm : barMagnitude[bar] * 0.75f;
     barPeak[bar] = max(barPeak[bar] * 0.95f, barMagnitude[bar]);
   }
@@ -834,6 +1000,8 @@ void spotifyCallback(CurrentlyPlaying currentlyPlaying) {
     }
 
 #if ENABLE_SPOTIFY_LIKE
+    // See the note on this field near its declaration if this line fails
+    // to compile against your SpotifyArduino version.
     currentSpotifyTrackId = String(currentlyPlaying.trackId);
 #endif
   } else {
@@ -918,6 +1086,10 @@ void scanSDTracks() {
   AUDIO_UNLOCK();
 }
 
+// Called from playTrack() -- which runs on the UI task (user picks a track)
+// AND on audioTask (audio_eof_mp3 auto-advancing) -- and from networkTask's
+// Spotify progressive-cover-fail path. Locking internally means every call
+// site is automatically protected without having to remember to wrap it.
 void clearCoverBox() {
   DISPLAY_LOCK();
   tft.fillRect(COVER_X, COVER_Y, COVER_W, COVER_H, COL_PANEL);
@@ -976,6 +1148,11 @@ int8_t mapEQ(int rawValue) {
   return 0; 
 }
 
+// POT5 mapped to Pan/Balance, centered on POT5_CENTER (see the big comment
+// near that constant's declaration for the calibration caveat).
+// NOTE: verify audio.setBalance()'s expected range against your installed
+// ESP32-audioI2S version -- this assumes roughly -16 (full left) .. +16
+// (full right), which is typical for that library, but forks vary.
 int8_t mapBalance(int rawValue) {
   int lo = POT5_CENTER - POT5_DEADZONE;
   int hi = POT5_CENTER + POT5_DEADZONE;
@@ -1052,6 +1229,9 @@ void updateDSP() {
   }
 }
 
+// Called when SW2 long-press toggles POT5's mode. Snaps whichever control
+// is being LEFT back to neutral, so switching modes never leaves audio
+// "stuck" pitched or panned from before the switch.
 void resetInactivePot5Control() {
   if (pot5IsSpeedMode) {
     // Entering Speed mode -- reset pan to center.
@@ -1082,6 +1262,9 @@ void updateBattery() {
   lastBattRead = millis();
 
   int raw = analogRead(BATT_PIN);
+  // Heavy exponential smoothing -- audio playback causes real current draw
+  // spikes on the battery rail, and this is what keeps the percentage from
+  // jumping around with them instead of settling.
   battSmoothedRaw = (battSmoothedRaw < 0) ? raw : (battSmoothedRaw * 0.9f + raw * 0.1f);
 
   float vAdc = (battSmoothedRaw / 4095.0f) * 3.3f;
@@ -1092,6 +1275,11 @@ void updateBattery() {
 #endif
 
 #if ENABLE_SPOTIFY_LIKE
+// ==========================================
+// 6c. SPOTIFY "LIKE" (self-contained OAuth -- does not touch the
+// SpotifyArduino library's internal token, so it can't conflict with its
+// polling calls in networkTask)
+// ==========================================
 String cachedSpotifyAccessToken = "";
 unsigned long spotifyTokenExpiresAt = 0;
 
@@ -1194,7 +1382,9 @@ void maybePrefetchNextTrack() {
     nextTrackPreopened = SD.open(path);
 
     if (nextTrackPreopened) {
-
+      // Touch the first chunk so the SD driver/FAT cache is warm for the
+      // handoff -- this read-then-rewind is the actual point, not keeping
+      // the handle open (connecttoFS() opens its own handle regardless).
       uint8_t warm[4096];
       nextTrackPreopened.read(warm, sizeof(warm));
       nextTrackPreopened.seek(0);
@@ -1205,6 +1395,10 @@ void maybePrefetchNextTrack() {
 }
 #endif
 
+// Runs entirely on networkTask now. Holds displayMutex for its whole
+// duration -- safe to do so because appState == STATE_SYNC the entire time,
+// and the UI task's dispatch never touches tft while in that state (see
+// loop()), so there's no real contention, just an extra guarantee.
 void performWiFiSync() {
   AUDIO_LOCK();
   audio.stopSong();
@@ -1397,7 +1591,8 @@ void drawSpotifyDynamic() {
   DISPLAY_UNLOCK();
 
 #if ENABLE_SPOTIFY_LIKE
-
+  // Edge-triggered: only touches the screen when the flash state actually
+  // changes, instead of redrawing this row every single dynamic pass.
   static bool likedRowActive = false;
   bool likeNow = millis() < likedFlashUntil;
   if (likeNow != likedRowActive) {
@@ -1485,6 +1680,9 @@ void drawSDPlayerDynamic() {
       lastDrawnSDTrackIndex = currentTrackIndex;
     }
 
+    // Live pan/speed readout (whichever POT5 currently controls), left of
+    // [MIDI] -- runs every dynamic pass, not gated behind the track-index
+    // check above, so it tracks the pot live.
     static float lastDrawnSpeed = -1.0f;
     static int8_t lastDrawnPan = -100;
     if (pot5IsSpeedMode) {
@@ -1671,66 +1869,53 @@ void handleSW1SW2() {
   bool sw1State = digitalRead(SW1_PIN);
   bool sw2State = digitalRead(SW2_PIN);
 
-#if ENABLE_SPOTIFY_LIKE
-  // SW1 press/hold tracking. Short press keeps its original meaning
-  // (skip); a long press ONLY does something different in STATE_SPOTIFY,
-  // where it fires "Like" instead. SD player behavior is unchanged.
+  // SW1 press/hold tracking. Short press = Play/Pause (fires on release
+  // below). A 700ms hold does something context-dependent: toggles the
+  // Pan/Speed mode while in the SD player, or fires "Like" in the Spotify
+  // view if ENABLE_SPOTIFY_LIKE is on. Outside those two states, holding
+  // SW1 does nothing extra.
   if (sw1LastState == HIGH && sw1State == LOW) {
     sw1PressStart = millis();
     sw1LongTriggered = false;
   }
   if (sw1State == LOW && !sw1LongTriggered && millis() - sw1PressStart > LONG_PRESS_MS) {
     sw1LongTriggered = true;
-    if (appState == STATE_SPOTIFY && wifiMulti.run() == WL_CONNECTED) {
-      if (likeCurrentSpotifyTrack()) {
-        likedFlashUntil = millis() + 1500;
-      }
-    }
-  }
-#endif
-
-  // SW2 press/hold tracking. Short press keeps its original meaning
-  // (Play/Pause, fires on release below); a long press during SD playback
-  // toggles POT5 between Pan and Speed mode instead. Outside SD_PLAYING,
-  // holding SW2 does nothing extra -- it just falls through to nothing on
-  // release, same as before this feature existed.
-  if (sw2LastState == HIGH && sw2State == LOW) {
-    sw2PressStart = millis();
-    sw2LongTriggered = false;
-  }
-  if (sw2State == LOW && !sw2LongTriggered && millis() - sw2PressStart > LONG_PRESS_MS) {
-    sw2LongTriggered = true;
     if (appState == STATE_SD_PLAYING) {
       pot5IsSpeedMode = !pot5IsSpeedMode;
       resetInactivePot5Control();
       pot5NeedsReapply = true;
       screenNeedsFullDraw = true; // redraw DJ mixer label / readout immediately
     }
+#if ENABLE_SPOTIFY_LIKE
+    else if (appState == STATE_SPOTIFY && wifiMulti.run() == WL_CONNECTED) {
+      if (likeCurrentSpotifyTrack()) {
+        likedFlashUntil = millis() + 1500;
+      }
+    }
+#endif
+  }
+
+  // SW2 press/hold tracking. Short press = skip next (fires on release
+  // below); holding 700ms = previous track.
+  if (sw2LastState == HIGH && sw2State == LOW) {
+    sw2PressStart = millis();
+    sw2LongTriggered = false;
+  }
+  if (sw2State == LOW && !sw2LongTriggered && millis() - sw2PressStart > LONG_PRESS_MS) {
+    sw2LongTriggered = true;
+    if (appState == STATE_SPOTIFY) {
+      if (wifiMulti.run() == WL_CONNECTED) spotify.previousTrack();
+    } else if (appState == STATE_SD_PLAYING) {
+      playTrack(currentTrackIndex - 1);
+    }
   }
 
   if (millis() - lastButtonAction > BUTTON_DEBOUNCE) {
     if (sw1LastState == LOW && sw1State == HIGH) {
-      // Skip fires on release (not press) so a long-press-triggered Like
-      // in STATE_SPOTIFY can preempt it via the wasLong check below.
-      bool wasLong =
-#if ENABLE_SPOTIFY_LIKE
-        sw1LongTriggered;
-#else
-        false;
-#endif
-      if (!wasLong) {
-        if (appState == STATE_SPOTIFY) {
-          if (wifiMulti.run() == WL_CONNECTED) spotify.nextTrack();
-        } else if (appState == STATE_SD_PLAYING) {
-          playTrack(currentTrackIndex + 1);
-        }
-      }
-      lastButtonAction = millis();
-    }
-    if (sw2LastState == LOW && sw2State == HIGH) {
-      // Same pattern as SW1 above: a long-press-triggered mode toggle
-      // preempts the short-press Play/Pause action on release.
-      if (!sw2LongTriggered) {
+      // SW1 tap = Play/Pause. A long-press-triggered action above (Pan/
+      // Speed toggle or Like) preempts this on release, same pattern as
+      // SW2 below.
+      if (!sw1LongTriggered) {
         if (appState == STATE_SPOTIFY) {
           if (wifiMulti.run() == WL_CONNECTED) {
             if (spotifyIsPlaying) spotify.pause();
@@ -1745,10 +1930,111 @@ void handleSW1SW2() {
       }
       lastButtonAction = millis();
     }
+    if (sw2LastState == LOW && sw2State == HIGH) {
+      // SW2 tap = skip next. A long-press-triggered previous-track (above)
+      // preempts this on release, same pattern as SW1.
+      if (!sw2LongTriggered) {
+        if (appState == STATE_SPOTIFY) {
+          if (wifiMulti.run() == WL_CONNECTED) spotify.nextTrack();
+        } else if (appState == STATE_SD_PLAYING) {
+          playTrack(currentTrackIndex + 1);
+        }
+      }
+      lastButtonAction = millis();
+    }
   }
 
   sw1LastState = sw1State;
   sw2LastState = sw2State;
+}
+
+// Blanks the screen, stops audio, and puts the ESP32 into deep sleep with
+// wake-on-press armed for the same button. A wake is a full reboot (deep
+// sleep can't preserve RAM/WiFi/SD state) -- setup() runs again from
+// scratch, it does not resume in place.
+void enterDeepSleep() {
+  AUDIO_LOCK();
+  audio.stopSong();
+  AUDIO_UNLOCK();
+
+  DISPLAY_LOCK();
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_MAGENTA);
+  tft.setCursor(10, 60);
+  tft.print("POWERING OFF...");
+  DISPLAY_UNLOCK();
+  delay(600); // let the message actually be seen before we cut out
+
+  DISPLAY_LOCK();
+  tft.fillScreen(ST77XX_BLACK); // blank it properly rather than freezing on the message
+  DISPLAY_UNLOCK();
+
+  // The digital-domain pull-up from pinMode(INPUT_PULLUP) does NOT carry
+  // over into deep sleep -- that GPIO matrix powers down, leaving only the
+  // separate RTC IO block active. Without explicitly enabling the pull-up
+  // there too, this pin floats the instant sleep starts; since ext0 wakeup
+  // is level-triggered (not edge), a floating/LOW read looks like "already
+  // pressed" and wakes the chip back up almost immediately -- exactly a
+  // sleep-then-wake-itself loop.
+  rtc_gpio_pullup_en((gpio_num_t)PWR_SW_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)PWR_SW_PIN);
+
+  // Wake on the next press of the same button: active-LOW, matching the
+  // INPUT_PULLUP wiring (pressed = 0).
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PWR_SW_PIN, 0);
+  esp_deep_sleep_start();
+  // Never reached -- see the comment above the function.
+}
+
+// Tap = wake (handled entirely by the ext0 config above; there's nothing
+// to do here for it since a tap while asleep is a hardware reset, not
+// something this running code sees). Hold 3s while awake = power off.
+//
+// Two safety nets against a flaky/miswired button causing a sleep-wake-
+// sleep loop (ext0 wakeup is LEVEL-triggered, not edge-triggered -- if the
+// pin is stuck LOW, the wake condition is already true the instant we go
+// to sleep, so the chip wakes again almost immediately):
+//  1. The power-off timer never arms at all until this pin has read HIGH
+//     at least once since boot. A clean idle button reads HIGH via the
+//     internal pull-up; if it never does, that's very likely a bad solder
+//     joint, a short to GND, or the switch wired NC instead of NO.
+//  2. A few-second grace window right after boot/wake, so even a
+//     borderline-noisy pin can't immediately re-trigger sleep the moment
+//     we come back up.
+void handlePowerSwitch() {
+  bool state = digitalRead(PWR_SW_PIN);
+  if (state == HIGH) pwrPinEverSeenHigh = true;
+
+  if (!pwrPinEverSeenHigh) {
+    static unsigned long lastWarn = 0;
+    if (millis() - lastWarn > 2000) {
+      Serial.printf("[PWR] GPIO%d has never read HIGH since boot -- check the "
+                    "button's wiring/solder joint (it should idle HIGH via the "
+                    "internal pull-up when not pressed). Power-off is disabled "
+                    "until a clean HIGH is seen.\n", PWR_SW_PIN);
+      lastWarn = millis();
+    }
+    pwrLastState = state;
+    return;
+  }
+
+  if (millis() < PWR_BOOT_GRACE_MS) {
+    pwrLastState = state;
+    return;
+  }
+
+  if (pwrLastState == HIGH && state == LOW) {
+    pwrPressStart = millis();
+    pwrLongTriggered = false;
+  }
+
+  if (state == LOW && !pwrLongTriggered && millis() - pwrPressStart > PWR_HOLD_MS) {
+    pwrLongTriggered = true;
+    enterDeepSleep();
+  }
+
+  pwrLastState = state;
 }
 
 void applyFallbackCover() {
@@ -1791,7 +2077,10 @@ void applyFallbackCover() {
 // poll or a JPEG decode never makes the encoder/buttons feel laggy.
 void networkTask(void *parameter) {
   while (true) {
-
+    // --- Wi-Fi sync: owns the whole screen while it runs. The UI task's
+    // dispatch has no STATE_SYNC branch anymore, so there's nothing to
+    // coordinate with -- performWiFiSync() blocks here until done, then
+    // calls enterMenu() itself to hand control back. ---
     if (appState == STATE_SYNC) {
       performWiFiSync();
     }
@@ -1898,12 +2187,19 @@ void setup() {
   pinMode(ENC_SW, INPUT_PULLUP);
   pinMode(SW1_PIN, INPUT_PULLUP);
   pinMode(SW2_PIN, INPUT_PULLUP);
-  
+  pinMode(PWR_SW_PIN, INPUT_PULLUP);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woke from deep sleep via power button");
+  } else {
+    Serial.println("Cold boot");
+  }
+
   analogReadResolution(12);
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), encoderISR, CHANGE);
 
   tft.initR(INITR_BLACKTAB);
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
   initCyberPalette();
 
@@ -1955,8 +2251,41 @@ void setup() {
 // heaviest thing it does is a screen redraw or a JPEG blit from RAM.
 // ==========================================
 void loop() {
+  // TEMP DIAGNOSTIC -- remove once buttons are confirmed working. Prints
+  // the raw electrical state of each button every 500ms, BEFORE any of
+  // the tap/hold logic below touches it. With INPUT_PULLUP wiring (leg to
+  // GPIO, other leg to GND) these should read 1 when idle and 0 the
+  // instant you press, for every single one of them, including PWR.
+  // If a pin never changes when physically pressed -> wiring/solder/board
+  // conflict on that specific pin (see message below the code).
+  // If they DO toggle correctly but nothing seems to happen -> that's
+  // app-logic gating, not wiring (SW1/SW2 taps only act in the Spotify or
+  // SD Player screens, not from the main menu; PWR only reacts to a 3s
+  // hold, a tap does nothing while awake).
+  static unsigned long lastPinDebug = 0;
+  if (millis() - lastPinDebug > 500) {
+    lastPinDebug = millis();
+    Serial.printf("[PINCHECK] SW1(%d)=%d  SW2(%d)=%d  PWR(%d)=%d  ENC_SW(%d)=%d\n",
+                  SW1_PIN, digitalRead(SW1_PIN),
+                  SW2_PIN, digitalRead(SW2_PIN),
+                  PWR_SW_PIN, digitalRead(PWR_SW_PIN),
+                  ENC_SW, digitalRead(ENC_SW));
+  }
+
   handleEncoderSwitch();
   handleSW1SW2();
+  handlePowerSwitch();
+
+  // Volume was being read for the on-screen display but never actually
+  // applied to the audio library -- that's why turning POT1 moved the
+  // "Vol:" readout but changed nothing you could hear.
+  if (appState == STATE_SD_PLAYING) {
+    int vol = readSmoothedVolume();
+    AUDIO_LOCK();
+    audio.setVolume(vol);
+    AUDIO_UNLOCK();
+  }
+
   updateDSP();
 
   if (millis() - lastHeapLog > 15000) {
